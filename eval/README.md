@@ -38,8 +38,8 @@ Keys are read from the environment only and are never written to runs or logs.
 
 On the page:
 
-- **Run smoke**: one filing (Apple FY2024), 8k tokens, both models, three fields (fiscal year end, one planted code, one planted note). It costs a few cents.
-- **Run full grid…**: three filings (AAPL, MSFT and KO for FY2024) at 8k, 32k and 128k tokens and full length, every field. It shows a cost estimate before it starts, from OpenRouter's prices where a model has one. Hugging Face and Claude Code models are listed as unpriced. Each Qwen model's part of a full grid is about 370k input tokens: about $0.05 at DeepInfra's rates (Qwen3-Next is $0.09 per million input tokens and $1.10 per million output tokens; Qwen3-235B is $0.09 and $0.55).
+- **Run smoke**: one filing (Apple FY2024), 8k tokens, every model, three fields (fiscal year end, one planted code, one planted note). It costs a few cents.
+- **Run full grid…**: seven FY2024 filings, 45k to 208k tokens long (AAPL, MSFT, GE, KO, F, PFE and BAC), at 8k, 16k, 32k, 64k and 128k tokens and full length, every field. It shows a cost estimate before it starts, from OpenRouter's prices where a model has one. Hugging Face and Claude Code models are listed as unpriced. Each model's part of a full grid is about 2.5M input tokens: about $0.25 per Qwen model at DeepInfra's rates (Qwen3-Next is $0.09 per million input tokens and $1.10 per million output tokens; Qwen3-235B is $0.09 and $0.55).
 - **Use mode**: fetch a 10-K by ticker and fiscal year, or upload an `.htm`, `.html` or `.txt` file, and give a JSON schema (objects, arrays, strings, numbers, booleans). It uses the same extraction code as the eval, with no scoring.
 
 ## Models
@@ -89,7 +89,7 @@ uv run python -c "import app, json; print(app.log_mlflow(json.load(open('runs/<i
 
 **Tolerant fields, real.** The main products or services (Item 1), the two main risk factors (Item 1A) and what drove the change in revenue (Item 7). An LLM judge grades each answer against the opening of that section.
 
-**Planted facts.** At 10, 30, 50, 70 and 90% of the context that is sent, the app inserts a paragraph with a made-up reference code (exact, for example `QX-48213-7`) and a short made-up statement (tolerant). Values are seeded per filing, so every model and length sees the same ones.
+**Planted facts.** Near 10, 30, 50, 70 and 90% of the context that is sent, the app inserts three paragraphs, 2% apart, each with a made-up reference code (exact, for example `QX-48213-7`) and a short made-up statement (tolerant). That gives 15 exact and 15 tolerant planted questions per call, and about 21 answers per planted heatmap cell across the full grid. Values are seeded per filing, so every model and length sees the same ones.
 
 **Length.** The filing is cut to 8k, 32k and 128k tokens, and also sent whole when it fits the model. A length is skipped when the filing is shorter than it. The budget covers the whole prompt: 2,048 tokens are kept free for instructions, schema and answer. Tokens are counted with `o200k_base`. Each model's own tokenizer differs, which is why the reported prompt tokens are recorded too.
 

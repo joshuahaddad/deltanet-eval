@@ -75,8 +75,21 @@ def test_locate_and_renderings():
 
 def test_planted_facts_deterministic():
     a, b = app.planted_facts("AAPL-2024"), app.planted_facts("AAPL-2024")
-    assert a == b and len(a) == 2 * len(app.DEPTHS)
-    assert {f["target"] for f in a} == set(app.DEPTHS)
+    assert a == b and len(a) == 2 * app.PLANTS_PER_DEPTH * len(app.DEPTHS)
+    assert len({f["field"] for f in a}) == len(a) and len({f["truth"] for f in a}) == len(a)
+    for d in app.DEPTHS:  # each depth gets its facts, all inside its heatmap bin
+        near = [f["target"] for f in a if f["kind"] == "exact" and abs(f["target"] - d) < 0.1]
+        assert len(near) == app.PLANTS_PER_DEPTH and all(int(t * 5) == int(d * 5) for t in near)
+
+
+def test_build_context_plants_land_at_depth():
+    filing = {"ticker": "T", "fy": 2024, "truths": {},
+              "text": "\n".join(f"Line {i} of the filing body." for i in range(20000))}
+    for budget in (8192, 65536):
+        ctx, qs = app.build_context(filing, budget)
+        assert app.n_tokens(ctx) <= budget
+        for q in qs:
+            assert abs(q["depth"] - q["target"]) < 0.01
 
 
 def test_schema_model_types():

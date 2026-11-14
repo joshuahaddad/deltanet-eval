@@ -132,10 +132,16 @@ def get_filing(ticker: str, fy: int) -> dict:
     if cik is None:
         raise ValueError(f"unknown ticker {ticker}")
     facts = json.loads(sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"))["facts"]
-    recent = json.loads(sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json"))["filings"]["recent"]
+    filings = json.loads(sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json"))["filings"]
     accns = {f["accn"] for u in facts["us-gaap"].get("Assets", {}).get("units", {}).values()
              for f in u if f["form"] == "10-K" and f.get("fy") == fy and f.get("fp") == "FY"}
-    i = next((i for i, a in enumerate(recent["accessionNumber"]) if a in accns and recent["form"][i] == "10-K"), None)
+    # "recent" holds the last 1,000 filings; heavy filers (banks) push the 10-K into the older pages
+    for page in [filings["recent"]] + [p["name"] for p in filings.get("files", [])]:
+        recent = page if isinstance(page, dict) else json.loads(sec_get(f"https://data.sec.gov/submissions/{page}"))
+        i = next((i for i, a in enumerate(recent["accessionNumber"]) if a in accns and recent["form"][i] == "10-K"),
+                 None)
+        if i is not None:
+            break
     if i is None:
         raise ValueError(f"no 10-K for {ticker} fiscal year {fy}")
     accn, period_end = recent["accessionNumber"][i], recent["reportDate"][i]
@@ -237,7 +243,7 @@ def locate(text: str, truth, typ: str) -> int | None:
 
 # ---------------------------------------------------------------- planting and truncation
 
-PLANTS = [  # (subject, tolerant statement, tolerant question)
+PLANTS = [  # (subject, tolerant statement, tolerant question); PLANTS_PER_DEPTH per depth, in order
     ("the Brookfield archive audit",
      "The records team noted that the Brookfield archive will move to cold storage because staff rarely request files older than ten years.",
      "Why is the Brookfield archive moving to cold storage?"),
@@ -253,20 +259,54 @@ PLANTS = [  # (subject, tolerant statement, tolerant question)
     ("the travel committee review",
      "The travel committee replaced quarterly offsites with one annual meeting to cut travel time for field teams.",
      "What did the travel committee change, and why?"),
+    ("the Ashcombe fleet study",
+     "The Ashcombe depot switched its delivery vans to a four-day rota after drivers reported fatigue on long weekly routes.",
+     "Why did the Ashcombe depot change its delivery rota?"),
+    ("the Pellham badge upgrade",
+     "Security staff at the Pellham site replaced paper visitor logs with badges because the logs were often illegible.",
+     "Why were the paper visitor logs at Pellham replaced?"),
+    ("the Corran Bay recycling trial",
+     "The Corran Bay plant stopped its cardboard recycling trial because the local collector raised its fees twice in one year.",
+     "Why did the Corran Bay recycling trial stop?"),
+    ("the Whitlow mentoring scheme",
+     "Engineers in the Whitlow group started pairing new hires with senior staff because early attrition had doubled.",
+     "Why did the Whitlow group start pairing new hires with senior staff?"),
+    ("the Ostend kiosk rollout",
+     "The Ostend stores delayed their self-service kiosks because older customers found the touch screens hard to read.",
+     "Why were the Ostend self-service kiosks delayed?"),
+    ("the Harrowgate cafeteria review",
+     "The Harrowgate cafeteria moved to local suppliers after a long delivery delay left it without fresh produce for a week.",
+     "Why did the Harrowgate cafeteria move to local suppliers?"),
+    ("the Fenwick help desk change",
+     "The Fenwick help desk extended its hours into the evening because most overseas tickets arrived after the office closed.",
+     "Why did the Fenwick help desk extend its hours?"),
+    ("the Kestrel parking review",
+     "The Kestrel campus turned half its parking lot into bike storage after a commuter survey showed most staff cycled in summer.",
+     "Why did the Kestrel campus convert parking into bike storage?"),
+    ("the Dunmore printing policy",
+     "The Dunmore office removed most of its printers because staff printed fewer than ten pages a week on average.",
+     "Why did the Dunmore office remove most of its printers?"),
+    ("the Selby training audit",
+     "The Selby plant moved safety training from video to hands-on sessions because quiz scores after the videos were poor.",
+     "Why did the Selby plant change how it runs safety training?"),
 ]
+PLANTS_PER_DEPTH = 3
+PLANT_SPREAD = 0.02  # the facts at one depth sit 2% apart, all inside its 20%-wide heatmap bin
 
 
 def planted_facts(seed: str) -> list[dict]:
     rng = random.Random(seed)
     out = []
-    for d, (subject, statement, question) in zip(DEPTHS, PLANTS):
+    for n, (subject, statement, question) in enumerate(PLANTS):
+        d, j = DEPTHS[n // PLANTS_PER_DEPTH], n % PLANTS_PER_DEPTH
+        target = round(d + (j - (PLANTS_PER_DEPTH - 1) / 2) * PLANT_SPREAD, 4)
         code = f"{rng.choice('QXZKV')}{rng.choice('QXZKV')}-{rng.randint(10000, 99999)}-{rng.randint(1, 9)}"
-        pct = round(d * 100)
-        out.append({"field": f"planted_code_{pct}", "kind": "exact", "source": "planted", "type": "code", "target": d,
-                    "question": f"What is the internal reference code for {subject}?", "truth": code,
-                    "paragraph": f"Internal reference code for {subject}: {code}. {statement}"})
-        out.append({"field": f"planted_note_{pct}", "kind": "tolerant", "source": "planted", "type": "text",
-                    "target": d, "question": question, "truth": statement})
+        tag = f"{round(d * 100)}{'abc'[j]}"
+        out.append({"field": f"planted_code_{tag}", "kind": "exact", "source": "planted", "type": "code",
+                    "target": target, "question": f"What is the internal reference code for {subject}?",
+                    "truth": code, "paragraph": f"Internal reference code for {subject}: {code}. {statement}"})
+        out.append({"field": f"planted_note_{tag}", "kind": "tolerant", "source": "planted", "type": "text",
+                    "target": target, "question": question, "truth": statement})
     return out
 
 
@@ -440,9 +480,11 @@ def judge(question: str, reference: str, answer) -> tuple[bool, dict]:
 
 PRESETS = {
     "smoke": {"filings": [["AAPL", 2024]], "lengths": [8192],
-              "fields": ["fiscal_year_end", "planted_code_50", "planted_note_50"]},
-    "full": {"filings": [["AAPL", 2024], ["MSFT", 2024], ["KO", 2024]],
-             "lengths": [8192, 32768, 131072, "full"], "fields": None},
+              "fields": ["fiscal_year_end", "planted_code_50b", "planted_note_50b"]},
+    # 45k to 208k tokens, so the 128k column is real; BAC's full length still fits a 262k window
+    "full": {"filings": [["AAPL", 2024], ["MSFT", 2024], ["GE", 2024], ["KO", 2024], ["F", 2024], ["PFE", 2024],
+                         ["BAC", 2024]],
+             "lengths": [8192, 16384, 32768, 65536, 131072, "full"], "fields": None},
 }
 
 
