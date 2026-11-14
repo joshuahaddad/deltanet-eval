@@ -86,3 +86,36 @@ def test_schema_model_types():
     assert m(revenue="391035", eps=None, segments=["Americas"]).revenue == 391035.0
     with pytest.raises(ValueError, match="unknown type 'float'"):
         app.schema_model({"type": "object", "properties": {"revenue": {"type": "float"}}})
+
+
+def _fake_run():
+    q = lambda field, kind, source, depth, correct: {"field": field, "kind": kind, "source": source, "depth": depth,
+                                                     "question": "?", "truth": "t", "answer": "a", "correct": correct}
+    return {"id": "test-run", "preset": "smoke", "judge": "j", "status": "done", "total_cost": 0.0,
+            "filings": [{"ticker": "AAPL", "fy": 2024}], "models": [{"name": "M", "model": "m/x", "base_url": "u"}],
+            "results": [
+                {"model": "M", "ticker": "AAPL", "fy": 2024, "length": 8192, "fields": [
+                    q("a", "exact", "planted", 0.5, True), q("b", "exact", "planted", 0.1, False),
+                    q("c", "exact", "real", None, False),  # not in the context: not scored
+                    q("d", "tolerant", "planted", 0.5, True)]},
+                {"model": "M", "ticker": "AAPL", "fy": 2024, "length": "full", "error": "boom",
+                 "fields": [q("a", "exact", "planted", 0.5, None)]}]}
+
+
+def test_accuracy_metrics():
+    m = app.accuracy_metrics(_fake_run()["results"])
+    assert m == {"acc/exact_planted": 0.5, "acc/exact_planted/8k": 0.5, "acc/tolerant_planted": 1.0,
+                 "acc/tolerant_planted/8k": 1.0, "n/exact_planted": 2, "n/exact_planted/8k": 2,
+                 "n/tolerant_planted": 1, "n/tolerant_planted/8k": 1}
+
+
+def test_log_mlflow(tmp_path, monkeypatch):
+    from mlflow.tracking import MlflowClient
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'm.db'}")
+    rid = app.log_mlflow(_fake_run())
+    c = MlflowClient()
+    child = c.search_runs([c.get_run(rid).info.experiment_id], f"tags.mlflow.parentRunId = '{rid}'")[0]
+    assert child.data.metrics["acc/exact_planted"] == 0.5 and child.data.metrics["calls_failed"] == 1
+    assert {a.path for a in c.list_artifacts(child.info.run_id)} == {"answers.csv", "calls.json"}
+    assert "run.json" in {a.path for a in c.list_artifacts(rid)}

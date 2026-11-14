@@ -30,6 +30,9 @@ uv run pytest
 | `ANTHROPIC_API_KEY` | optional: when set, `claude -p` bills it instead of your Claude subscription |
 | `EDGAR_CONTACT` | the `User-Agent: filing-recall <contact>` header that EDGAR requires |
 | `PORT` | optional, default 8765 |
+| `MLFLOW_TRACKING_URI` | optional: your MLflow server, e.g. `http://host:5000`. Unset logs to the local `eval/mlflow.db`. |
+| `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD` | optional: for a server with auth turned on (MLflow reads them itself) |
+| `MLFLOW_EXPERIMENT_NAME` | optional, default `filing-recall` |
 
 Keys are read from the environment only and are never written to runs or logs.
 
@@ -57,6 +60,27 @@ A LiteLLM gateway, for local models, is an OpenAI-compatible entry. The `model` 
 
 Each call records the serving provider (as the endpoint reports it, or `claude-code/firstParty`), the tokens sent (counted locally and as reported), the completion tokens and the cost. Reported prompt tokens include each model's own tokenizer and harness overhead. For example, an 8k cell of about 6.1k `o200k` tokens comes to about 11.3k tokens through Claude Code.
 
+## MLflow
+
+Each finished run is also logged to MLflow. By default it goes to a local store, `eval/mlflow.db` with artifacts in `eval/mlruns/`, both git-ignored. Browse it with:
+
+```bash
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+To use your server instead, set `MLFLOW_TRACKING_URI`, plus the username and password if it uses auth.
+
+- **The parent run** is named after the run ID. It holds the run's parameters (preset, judge, filings, status), `total_cost_usd` and the whole run file as `run.json`.
+- **One child run per model** holds the heatmap cells as metrics: `acc/<kind>_<source>` overall and `acc/<kind>_<source>/<length>`, with matching `n/...` counts. It also has `calls_failed`, `prompt_tokens`, `cost_usd` and `notional_cost_usd`, plus two artifacts:
+  - `answers.csv`: one row per question, with what the model returned, the truth, the depth and how it was scored.
+  - `calls.json`: provider, tokens, cost and any error for each call.
+
+The run file in `runs/` stays the record. If logging to MLflow fails, the run still finishes, and the error shows next to it on the page and as `mlflow_error` in the file. To log an older run, run:
+
+```bash
+uv run python -c "import app, json; print(app.log_mlflow(json.load(open('runs/<id>.json'))))"
+```
+
 ## What is measured
 
 **Documents.** The 10-K's primary HTML document from EDGAR is converted to text, with each table row on one line, cells joined by ` | `. PDFs are never used.
@@ -83,6 +107,7 @@ There are four panels: exact or tolerant, crossed with real or planted, with the
 - `index.html`: the single page.
 - `models.json`: endpoints and models.
 - `runs/`: one JSON file per run, committed because the post's figures are drawn from them.
+- `mlflow.db`, `mlruns/`: the local MLflow store (git-ignored).
 - `tests/`: normalisation, planting depth, truncation and exact-match scoring.
 - `.cache/`: EDGAR responses and converted text (git-ignored).
 

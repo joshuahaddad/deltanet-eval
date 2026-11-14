@@ -536,11 +536,79 @@ def start_run(preset: str) -> str:
             run["status"], run["error"] = "error", f"{type(e).__name__}: {e}"
         run["finished"] = dt.datetime.now().isoformat(timespec="seconds")
         run["total_cost"] = sum((r.get("cost") or 0) + (r.get("judge_cost") or 0) for r in run["results"])
+        try:
+            run["mlflow_run_id"] = log_mlflow(run)
+        except Exception as e:  # the run file is the record; MLflow is a copy, so a logging failure doesn't fail the run
+            run["mlflow_error"] = f"{type(e).__name__}: {e}"
         save()
 
     save()
     threading.Thread(target=work, daemon=True).start()
     return rid
+
+
+ANSWER_COLUMNS = ["ticker", "fy", "length", "field", "kind", "source", "depth", "question", "truth", "answer",
+                  "correct", "judge_reason", "judge_error", "call_error"]
+
+
+def answer_rows(results: list[dict]) -> list[dict]:
+    """One row per question asked: what the model returned, and how it was scored."""
+    return [{"ticker": r["ticker"], "fy": r["fy"], "length": r["length"], "call_error": r.get("error")}
+            | {k: q.get(k) for k in ANSWER_COLUMNS if k in q} for r in results for q in r["fields"]]
+
+
+def accuracy_metrics(results: list[dict]) -> dict:
+    """The heatmap cells, collapsed: accuracy and count per kind x source, overall and per length."""
+    cells = {}
+    for r in results:
+        if r.get("error"):
+            continue
+        length = r["length"] if r["length"] == "full" else f"{r['length'] // 1024}k"
+        for q in r["fields"]:
+            if q.get("correct") is None or q["depth"] is None:
+                continue
+            for key in (f"{q['kind']}_{q['source']}", f"{q['kind']}_{q['source']}/{length}"):
+                ok, n = cells.get(key, (0, 0))
+                cells[key] = (ok + bool(q["correct"]), n + 1)
+    return {f"acc/{k}": ok / n for k, (ok, n) in cells.items()} | {f"n/{k}": n for k, (_, n) in cells.items()}
+
+
+def log_mlflow(run: dict) -> str:
+    """Log a finished run to MLflow: a parent run holding run.json, with one child run per model holding its
+    metrics, call metadata and answers.csv. MLFLOW_TRACKING_URI picks the server; unset means eval/mlflow.db."""
+    import csv
+    import io
+
+    import mlflow
+
+    uri = os.environ.get("MLFLOW_TRACKING_URI") or f"sqlite:///{HERE / 'mlflow.db'}"
+    mlflow.set_tracking_uri(uri)
+    name = os.environ.get("MLFLOW_EXPERIMENT_NAME", "filing-recall")
+    if uri.startswith("sqlite:") and mlflow.get_experiment_by_name(name) is None:
+        mlflow.create_experiment(name, artifact_location=(HERE / "mlruns").as_uri())  # not relative to the cwd
+    mlflow.set_experiment(name)
+    with mlflow.start_run(run_name=run["id"]) as parent:
+        mlflow.log_params({"preset": run["preset"], "judge": run["judge"], "status": run["status"],
+                           "filings": ", ".join(f"{f['ticker']} FY{f['fy']}" for f in run.get("filings", []))})
+        mlflow.log_metric("total_cost_usd", run["total_cost"])
+        mlflow.log_dict(run, "run.json")
+        for m in run["models"]:
+            results = [r for r in run["results"] if r["model"] == m["name"]]
+            with mlflow.start_run(run_name=m["name"], nested=True):
+                mlflow.log_params({"model": m["model"], "endpoint": m.get("provider") or m.get("base_url")})
+                calls = [{k: v for k, v in r.items() if k != "fields"} for r in results]
+                mlflow.log_metrics(accuracy_metrics(results) | {
+                    "calls": len(results), "calls_failed": sum(1 for r in results if r.get("error")),
+                    "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in results),
+                    "cost_usd": sum((r.get("cost") or 0) for r in results),
+                    "notional_cost_usd": sum((r.get("notional_cost") or r.get("cost") or 0) for r in results)})
+                out = io.StringIO()
+                w = csv.DictWriter(out, ANSWER_COLUMNS)
+                w.writeheader()
+                w.writerows(answer_rows(results))
+                mlflow.log_text(out.getvalue(), "answers.csv")
+                mlflow.log_dict(calls, "calls.json")
+    return parent.info.run_id
 
 
 # ---------------------------------------------------------------- web

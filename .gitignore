@@ -8,3 +8,5 @@ figures/work/
 qa/shots/
 eval/.env
 .env
+eval/mlflow.db
+eval/mlruns/

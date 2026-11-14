@@ -98,7 +98,9 @@ async function showRun(id) {
   const run = await api(`/api/runs/${encodeURIComponent(id)}`);
   const cost = run.total_cost != null ? ` · $${run.total_cost.toFixed(4)}` : "";
   $("runinfo").innerHTML = `${esc(run.status)}${cost} · judge ${esc(run.judge)}` +
-    (run.error ? ` <span class="err">${esc(run.error)}</span>` : "");
+    (run.error ? ` <span class="err">${esc(run.error)}</span>` : "") +
+    (run.mlflow_run_id ? ` · MLflow ${esc(run.mlflow_run_id.slice(0, 8))}` : "") +
+    (run.mlflow_error ? ` <span class="err">MLflow: ${esc(run.mlflow_error)}</span>` : "");
   const models = run.models.map(m => m.name);
   const lengths = [...new Set(run.results.map(r => r.length))]
     .sort((a, b) => (a === "full" ? Infinity : a) - (b === "full" ? Infinity : b));
