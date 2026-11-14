@@ -48,6 +48,11 @@
 <section>
   <div class="row"><label for="runs">Run</label> <select id="runs"></select> <span id="runinfo" class="muted"></span></div>
   <div id="heatmaps"></div>
+  <h3>Exact answers by outcome</h3>
+  <p class="muted">Share of scored exact answers per outcome. Hallucinated: real exact facts that were not in the context, answered anyway.</p>
+  <div class="scroll"><table class="calls" id="outcomes"></table></div>
+  <h3>Judge check</h3>
+  <div class="row"><button id="jcheck">Check judge</button> <span id="jcinfo" class="muted"></span></div>
   <h3>Calls</h3>
   <div class="scroll"><table class="calls" id="calls"></table></div>
 </section>
@@ -79,6 +84,13 @@ const $ = id => document.getElementById(id);
 const DEPTH_BINS = [10, 30, 50, 70, 90];
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const lenLabel = l => l === "full" ? "full" : `${l / 1024}k`;
+const OUTCOMES = ["correct", "near_miss", "wrong", "abstained"];
+function wilson(ok, n, z = 1.96) {  // same as app.wilson
+  const p = ok / n, d = 1 + z * z / n, c = (p + z * z / (2 * n)) / d;
+  const h = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d;
+  return [Math.max(0, c - h), Math.min(1, c + h)];
+}
+const pct = (k, n) => n ? `${Math.round(100 * k / n)}% <small class="muted">${k}/${n}</small>` : "·";
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -121,9 +133,9 @@ async function showRun(id) {
         for (const l of lengths) {
           const c = cells[`${bin}|${l}`];
           if (!c) { html += `<td class="na">·</td>`; continue; }
-          const p = Math.round(100 * c.ok / c.n);
+          const p = Math.round(100 * c.ok / c.n), [lo, hi] = wilson(c.ok, c.n).map(x => Math.round(100 * x));
           html += `<td style="background: color-mix(in oklab, var(--hi) ${p}%, var(--lo)); color: ${p > 55 ? "#fff" : "inherit"}"
-                     title="${c.ok}/${c.n} correct">${p}%<br><small>${c.ok}/${c.n}</small></td>`;
+                     title="${c.ok}/${c.n} correct, 95% CI ${lo}–${hi}%">${p}%<br><small>${c.ok}/${c.n}</small></td>`;
         }
         html += "</tr>";
       }
@@ -132,11 +144,32 @@ async function showRun(id) {
     html += "</div>";
   }
   $("heatmaps").innerHTML = html;
+  let rows = "";
+  for (const model of models) for (const source of ["real", "planted"]) {
+    const fs = run.results.filter(r => r.model === model && !r.error).flatMap(r => r.fields)
+      .filter(f => f.kind === "exact" && f.source === source && f.outcome);
+    const scored = fs.filter(f => f.depth != null), absent = fs.filter(f => f.depth == null);
+    const halluc = source === "real" ? pct(absent.filter(f => f.outcome !== "abstained").length, absent.length) : "";
+    rows += `<tr><td>${esc(model)}</td><td>${source}</td>` +
+      OUTCOMES.map(o => `<td>${pct(scored.filter(f => f.outcome === o).length, scored.length)}</td>`).join("") +
+      `<td>${halluc}</td></tr>`;
+  }
+  $("outcomes").innerHTML = `<tr><th>model</th><th>facts</th>${OUTCOMES.map(o => `<th>${o.replace("_", " ")}</th>`).join("")}
+    <th>hallucinated</th></tr>` + rows;
+  const jc = run.judge_check;
+  const f2 = x => x == null ? "n/a" : x.toFixed(2);
+  $("jcheck").disabled = run.status === "running" || jc?.status === "running";
+  $("jcinfo").innerHTML = !jc ? "Re-grades a fixed sample of tolerant answers with a second judge. Not run automatically." :
+    jc.status === "running" ? `Running (${esc(jc.judge)})…` :
+    jc.status === "error" ? `<span class="err">${esc(jc.error)}</span>` :
+    `${esc(jc.judge)} vs ${esc(jc.first_judge)}: agreement ${jc.agreement == null ? "n/a" : Math.round(100 * jc.agreement) + "%"}
+     on ${jc.n} answers, Cohen's κ ${f2(jc.kappa)}` + (jc.errors ? ` · ${jc.errors} failed` : "") +
+    (jc.mlflow_error ? ` <span class="err">MLflow: ${esc(jc.mlflow_error)}</span>` : "");
   $("calls").innerHTML = `<tr><th>model</th><th>filing</th><th>length</th><th>provider</th><th>tokens sent (local / reported)</th>
     <th>out</th><th>cost</th><th>result</th></tr>` + run.results.map(r => `<tr><td>${esc(r.model)}</td><td>${esc(r.ticker)} FY${esc(r.fy)}</td>
     <td>${lenLabel(r.length)}</td><td>${esc(r.provider ?? "")}</td><td>${esc(r.context_tokens)} / ${esc(r.prompt_tokens ?? "")}</td>
     <td>${esc(r.completion_tokens ?? "")}</td><td>${r.cost != null ? "$" + r.cost.toFixed(4) : ""}</td>
-    <td>${r.error ? `<span class="err">${esc(r.error)}</span>` : `${r.fields.filter(f => f.correct).length}/${r.fields.filter(f => f.correct != null && f.depth != null).length} correct`}</td></tr>`).join("");
+    <td>${r.error ? `<span class="err">${esc(r.error)}</span>` : `${r.fields.filter(f => f.correct && f.depth != null).length}/${r.fields.filter(f => f.correct != null && f.depth != null).length} correct`}</td></tr>`).join("");
 }
 
 async function start(preset) {
@@ -161,6 +194,18 @@ async function start(preset) {
 $("smoke").onclick = () => start("smoke");
 $("full").onclick = () => start("full");
 $("runs").onchange = () => showRun($("runs").value);
+$("jcheck").onclick = async () => {
+  const id = $("runs").value;
+  try {
+    await api(`/api/runs/${encodeURIComponent(id)}/judge-check`, {method: "POST"});
+    await showRun(id);
+    const poll = setInterval(async () => {
+      const run = await api(`/api/runs/${encodeURIComponent(id)}`);
+      if ($("runs").value === id) showRun(id);
+      if (run.judge_check?.status !== "running") clearInterval(poll);
+    }, 3000);
+  } catch (err) { $("jcinfo").innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+};
 
 $("uextract").onclick = async () => {
   const fd = new FormData();
