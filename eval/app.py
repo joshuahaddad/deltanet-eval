@@ -329,11 +329,16 @@ def schema_model(schema: dict, name: str = "Extraction") -> type[BaseModel]:
     """JSON schema (objects, arrays, primitives) to a pydantic model; every field is optional."""
     def typ(prop: dict, key: str):
         t = prop.get("type", "string")
+        if isinstance(t, list):  # ["number", "null"]: every field is optional already
+            t = next((x for x in t if x != "null"), "string")
         if t == "object":
             return schema_model(prop, key.title().replace("_", ""))
         if t == "array":
             return list[typ(prop.get("items", {}), key)]
-        return TYPES.get(t, str)
+        if t not in TYPES:
+            raise ValueError(f"field {key!r}: unknown type {t!r}; use one of "
+                             f"{', '.join([*TYPES, 'object', 'array'])}")
+        return TYPES[t]
     fields = {k: (typ(p, k) | None, Field(None, description=p.get("description")))
               for k, p in schema.get("properties", {}).items()}
     return create_model(name, **fields)

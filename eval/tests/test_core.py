@@ -77,3 +77,12 @@ def test_planted_facts_deterministic():
     a, b = app.planted_facts("AAPL-2024"), app.planted_facts("AAPL-2024")
     assert a == b and len(a) == 2 * len(app.DEPTHS)
     assert {f["target"] for f in a} == set(app.DEPTHS)
+
+
+def test_schema_model_types():
+    m = app.schema_model({"type": "object", "properties": {
+        "revenue": {"type": "number"}, "eps": {"type": ["number", "null"]},
+        "segments": {"type": "array", "items": {"type": "string"}}}})
+    assert m(revenue="391035", eps=None, segments=["Americas"]).revenue == 391035.0
+    with pytest.raises(ValueError, match="unknown type 'float'"):
+        app.schema_model({"type": "object", "properties": {"revenue": {"type": "float"}}})
