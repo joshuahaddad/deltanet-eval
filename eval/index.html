@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>filing-recall</title>
+<style>
+  :root { --bg: #fafaf8; --fg: #1c1c1a; --muted: #6b6b66; --line: #ddddd6; --card: #fff;
+          --lo: #f3d6cf; --hi: #2f7d5b; --err: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --fg: #ececea; --muted: #9a9a94; --line: #33332f; --card: #1e1e1c;
+            --lo: #4a2620; --hi: #3fa877; --err: #ff8a80; }
+  }
+  body { background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; margin: 0 auto;
+         max-width: 1100px; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; } h2 { font-size: 1.1rem; margin: 28px 0 8px; }
+  h3 { font-size: .95rem; margin: 16px 0 6px; }
+  .muted { color: var(--muted); } .err { color: var(--err); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin: 14px 0; }
+  button, select, input, textarea { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 10px; }
+  button { cursor: pointer; } button:hover { border-color: var(--muted); }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 13px; }
+  pre { overflow-x: auto; font-size: 13px; background: var(--bg); padding: 10px; border-radius: 6px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .panels { display: flex; gap: 20px; flex-wrap: wrap; }
+  table.hm { border-collapse: collapse; font-size: 13px; }
+  table.hm th { font-weight: 500; color: var(--muted); padding: 3px 6px; }
+  table.hm td { width: 56px; height: 34px; text-align: center; border: 2px solid var(--card); }
+  table.hm td.na { background: transparent; color: var(--muted); }
+  .scroll { overflow-x: auto; }
+  table.calls { border-collapse: collapse; font-size: 13px; width: 100%; }
+  table.calls td, table.calls th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1>filing-recall</h1>
+<p class="muted">Exact recall (IDs, figures, dates) and tolerant recall (gist) on SEC 10-K filings, by depth and context length.</p>
+
+<section>
+  <div class="row">
+    <button id="smoke">Run smoke</button>
+    <button id="full">Run full grid…</button>
+    <span id="msg" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <div class="row"><label for="runs">Run</label> <select id="runs"></select> <span id="runinfo" class="muted"></span></div>
+  <div id="heatmaps"></div>
+  <h3>Calls</h3>
+  <div class="scroll"><table class="calls" id="calls"></table></div>
+</section>
+
+<h2>Use mode</h2>
+<section>
+  <p class="muted">Fetch a 10-K by ticker and fiscal year, or upload an HTML or text file, then give a JSON schema.</p>
+  <div class="row">
+    <select id="umodel" aria-label="Model"></select>
+    <input id="uticker" placeholder="Ticker" size="7" aria-label="Ticker">
+    <input id="ufy" placeholder="Fiscal year" size="9" aria-label="Fiscal year">
+    <span class="muted">or</span>
+    <input type="file" id="ufile" accept=".htm,.html,.txt" aria-label="Document file">
+  </div>
+  <p><textarea id="uschema" rows="9" aria-label="JSON schema">{
+  "type": "object",
+  "properties": {
+    "company_name": {"type": "string", "description": "Registrant name"},
+    "auditor": {"type": "string", "description": "Name of the independent auditor"},
+    "segments": {"type": "array", "items": {"type": "string"}, "description": "Reportable segments"}
+  }
+}</textarea></p>
+  <button id="uextract">Extract</button> <span id="umsg" class="muted"></span>
+  <pre id="uout" hidden></pre>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+const DEPTH_BINS = [10, 30, 50, 70, 90];
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const lenLabel = l => l === "full" ? "full" : `${l / 1024}k`;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+async function loadRuns(select) {
+  const runs = await api("/api/runs");
+  $("runs").innerHTML = runs.map(r => `<option value="${esc(r.id)}">${esc(r.id)} · ${esc(r.status)}</option>`).join("");
+  if (select) $("runs").value = select;
+  if ($("runs").value) showRun($("runs").value);
+}
+
+async function showRun(id) {
+  const run = await api(`/api/runs/${encodeURIComponent(id)}`);
+  const cost = run.total_cost != null ? ` · $${run.total_cost.toFixed(4)}` : "";
+  $("runinfo").innerHTML = `${esc(run.status)}${cost} · judge ${esc(run.judge)}` +
+    (run.error ? ` <span class="err">${esc(run.error)}</span>` : "");
+  const models = run.models.map(m => m.name);
+  const lengths = [...new Set(run.results.map(r => r.length))]
+    .sort((a, b) => (a === "full" ? Infinity : a) - (b === "full" ? Infinity : b));
+  let html = "";
+  for (const kind of ["exact", "tolerant"]) for (const source of ["real", "planted"]) {
+    html += `<h3>${kind} · ${source} facts</h3><div class="panels">`;
+    for (const model of models) {
+      const cells = {};
+      for (const r of run.results.filter(r => r.model === model && !r.error))
+        for (const f of r.fields.filter(f => f.kind === kind && f.source === source && f.depth != null && f.correct != null)) {
+          const bin = DEPTH_BINS[Math.min(4, Math.floor(f.depth * 5))];
+          const c = cells[`${bin}|${r.length}`] ??= {ok: 0, n: 0};
+          c.n++; c.ok += f.correct ? 1 : 0;
+        }
+      html += `<div><div>${esc(model)}</div><table class="hm"><tr><th>depth</th>${lengths.map(l => `<th>${lenLabel(l)}</th>`).join("")}</tr>`;
+      for (const bin of DEPTH_BINS) {
+        html += `<tr><th>${bin}%</th>`;
+        for (const l of lengths) {
+          const c = cells[`${bin}|${l}`];
+          if (!c) { html += `<td class="na">·</td>`; continue; }
+          const p = Math.round(100 * c.ok / c.n);
+          html += `<td style="background: color-mix(in oklab, var(--hi) ${p}%, var(--lo)); color: ${p > 55 ? "#fff" : "inherit"}"
+                     title="${c.ok}/${c.n} correct">${p}%<br><small>${c.ok}/${c.n}</small></td>`;
+        }
+        html += "</tr>";
+      }
+      html += "</table></div>";
+    }
+    html += "</div>";
+  }
+  $("heatmaps").innerHTML = html;
+  $("calls").innerHTML = `<tr><th>model</th><th>filing</th><th>length</th><th>provider</th><th>tokens sent (local / reported)</th>
+    <th>out</th><th>cost</th><th>result</th></tr>` + run.results.map(r => `<tr><td>${esc(r.model)}</td><td>${esc(r.ticker)} FY${esc(r.fy)}</td>
+    <td>${lenLabel(r.length)}</td><td>${esc(r.provider ?? "")}</td><td>${esc(r.context_tokens)} / ${esc(r.prompt_tokens ?? "")}</td>
+    <td>${esc(r.completion_tokens ?? "")}</td><td>${r.cost != null ? "$" + r.cost.toFixed(4) : ""}</td>
+    <td>${r.error ? `<span class="err">${esc(r.error)}</span>` : `${r.fields.filter(f => f.correct).length}/${r.fields.filter(f => f.correct != null && f.depth != null).length} correct`}</td></tr>`).join("");
+}
+
+async function start(preset) {
+  try {
+    if (preset === "full") {
+      $("msg").textContent = "Estimating cost…";
+      const e = await api("/api/estimate/full");
+      const unpriced = e.unpriced_models.length ? ` (no price for ${e.unpriced_models.join(", ")})` : "";
+      if (!confirm(`Full grid: ${e.calls} extraction calls, about $${e.usd.toFixed(2)}${unpriced}. Start?`)) { $("msg").textContent = ""; return; }
+    }
+    const {id} = await api(`/api/runs/${preset}`, {method: "POST"});
+    $("msg").textContent = `Started ${id}`;
+    await loadRuns(id);
+    const poll = setInterval(async () => {
+      const run = await api(`/api/runs/${encodeURIComponent(id)}`);
+      if ($("runs").value === id) showRun(id);
+      if (run.status !== "running") { clearInterval(poll); $("msg").textContent = `${id}: ${run.status}`; loadRuns(id); }
+    }, 3000);
+  } catch (err) { $("msg").innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+}
+
+$("smoke").onclick = () => start("smoke");
+$("full").onclick = () => start("full");
+$("runs").onchange = () => showRun($("runs").value);
+
+$("uextract").onclick = async () => {
+  const fd = new FormData();
+  fd.append("model", $("umodel").value);
+  fd.append("json_schema", $("uschema").value);
+  fd.append("ticker", $("uticker").value);
+  fd.append("fy", $("ufy").value);
+  if ($("ufile").files[0]) fd.append("file", $("ufile").files[0]);
+  $("umsg").textContent = "Extracting…"; $("uout").hidden = true;
+  try {
+    const r = await api("/api/extract", {method: "POST", body: fd});
+    $("uout").textContent = JSON.stringify(r, null, 2); $("uout").hidden = false; $("umsg").textContent = "";
+  } catch (err) { $("umsg").innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+};
+
+api("/api/config").then(c => {
+  $("umodel").innerHTML = c.models.map(m => `<option>${esc(m)}</option>`).join("");
+});
+loadRuns();
+</script>
+</body>
+</html>
