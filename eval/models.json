@@ -1,9 +1,30 @@
 {
   "models": [
-    {"name": "Kimi Linear", "base_url": "https://router.huggingface.co/v1", "api_key_env": "HF_TOKEN",
-     "model": "moonshotai/Kimi-Linear-48B-A3B-Instruct:featherless-ai", "context_length": 131072},
-    {"name": "Claude Sonnet 5.5", "provider": "claude-code", "model": "claude-sonnet-5-5", "context_length": 1000000}
+    {
+      "name": "Qwen3-Next 80B-A3B (Gated DeltaNet hybrid)",
+      "base_url": "https://router.huggingface.co/v1",
+      "api_key_env": "HF_TOKEN",
+      "model": "Qwen/Qwen3-Next-80B-A3B-Instruct:deepinfra",
+      "context_length": 262144
+    },
+    {
+      "name": "Qwen3 235B-A22B (full attention)",
+      "base_url": "https://router.huggingface.co/v1",
+      "api_key_env": "HF_TOKEN",
+      "model": "Qwen/Qwen3-235B-A22B-Instruct-2507:deepinfra",
+      "context_length": 262144
+    },
+    {
+      "name": "Claude Sonnet 5.5",
+      "provider": "claude-code",
+      "model": "claude-sonnet-5-5",
+      "context_length": 1000000
+    }
   ],
-  "judge": {"name": "Judge (Claude Haiku 5.5)", "provider": "claude-code", "model": "claude-haiku-5-5",
-            "context_length": 1000000}
+  "judge": {
+    "name": "Judge (Claude Haiku 5.5)",
+    "provider": "claude-code",
+    "model": "claude-haiku-5-5",
+    "context_length": 1000000
+  }
 }

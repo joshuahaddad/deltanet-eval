@@ -1,15 +1,22 @@
 # filing-recall
 
-A small long-context extraction eval on SEC 10-K filings. It measures *exact* recall (figures, dates, IDs) against *tolerant* recall (gist), by depth in the document and by context length. It compares Kimi Linear, a hybrid of 3 Kimi Delta Attention layers to 1 full-attention layer, with a full-attention Claude model. It is also a plain extraction tool: give it a document and a JSON schema, and it returns JSON.
+A small long-context extraction eval on SEC 10-K filings. It measures *exact* recall (figures, dates, IDs) against *tolerant* recall (gist), by depth in the document and by context length. It compares a linear-attention hybrid (3 delta-rule layers to 1 full-attention layer) with full-attention models. It is also a plain extraction tool: give it a document and a JSON schema, and it returns JSON.
 
 > Kimi Linear vs Claude differs in size and training, not just attention, so gaps here are not a clean test of the architecture.
+
+> **Models actually run.** Kimi Linear (Kimi Delta Attention) has no working hosted endpoint as of November 2026, and Gated DeltaNet-2 has no released model larger than about 1.3B. The default line-up is therefore:
+> - **Qwen3-Next-80B-A3B:** the same 3:1 hybrid design, built on Gated DeltaNet, the layer KDA refines.
+> - **Qwen3-235B-A22B:** a full-attention model from the same family, as a closer control than Claude.
+> - **Claude Sonnet 5.5:** as the frontier reference.
+>
+> The same caveat applies to every pair: Qwen3-Next and Qwen3-235B are closer in training but still differ in size. Results speak to Gated DeltaNet hybrids, not to KDA or Gated DeltaNet-2.
 
 ## Run
 
 Needs [uv](https://docs.astral.sh/uv/). From this folder:
 
 ```bash
-export HF_TOKEN=hf_...                # Kimi Linear via Hugging Face (Claude runs through your local `claude` login)
+export HF_TOKEN=hf_...                # the Qwen models via Hugging Face (Claude runs through your local `claude` login)
 export EDGAR_CONTACT=you@example.com # SEC requires a contact in the User-Agent
 uv run app.py                        # http://127.0.0.1:8765 (set PORT to change)
 uv run pytest
@@ -17,7 +24,7 @@ uv run pytest
 
 | Env var | Used for |
 |---|---|
-| `HF_TOKEN` | Kimi Linear, through Hugging Face's router to Featherless AI. A fine-grained token with "Make calls to Inference Providers". |
+| `HF_TOKEN` | the Qwen models, through Hugging Face's router to DeepInfra. A fine-grained token with "Make calls to Inference Providers". |
 | `OPENROUTER_API_KEY` | optional: any OpenRouter model you add to `models.json` |
 | `LITELLM_API_KEY` | optional: a LiteLLM gateway entry (see Models) |
 | `ANTHROPIC_API_KEY` | optional: when set, `claude -p` bills it instead of your Claude subscription |
@@ -29,7 +36,7 @@ Keys are read from the environment only and are never written to runs or logs.
 On the page:
 
 - **Run smoke**: one filing (Apple FY2024), 8k tokens, both models, three fields (fiscal year end, one planted code, one planted note). It costs a few cents.
-- **Run full grid…**: three filings (AAPL, MSFT and KO for FY2024) at 8k, 32k and 128k tokens and full length, every field. It shows a cost estimate before it starts, from OpenRouter's prices where a model has one. Hugging Face and Claude Code models are listed as unpriced: the Kimi half of a full grid is about 370k input tokens, well under $1 at Featherless's rates.
+- **Run full grid…**: three filings (AAPL, MSFT and KO for FY2024) at 8k, 32k and 128k tokens and full length, every field. It shows a cost estimate before it starts, from OpenRouter's prices where a model has one. Hugging Face and Claude Code models are listed as unpriced. Each Qwen model's part of a full grid is about 370k input tokens: about $0.05 at DeepInfra's rates (Qwen3-Next is $0.09 per million input tokens and $1.10 per million output tokens; Qwen3-235B is $0.09 and $0.55).
 - **Use mode**: fetch a 10-K by ticker and fiscal year, or upload an `.htm`, `.html` or `.txt` file, and give a JSON schema (objects, arrays, strings, numbers, booleans). It uses the same extraction code as the eval, with no scoring.
 
 ## Models
@@ -39,7 +46,7 @@ On the page:
 - **OpenAI-compatible endpoint:** `base_url`, `api_key_env` and `model`. Structured output goes through [Instructor](https://python.useinstructor.com/) in JSON mode, which handles parsing and retries. OpenRouter's catalogue supplies context length and price. For any other endpoint, add `"context_length"`.
 - **`"provider": "claude-code"`:** `model` and `context_length`. The call runs the local `claude -p` with no tools, no settings, no MCP servers and `--json-schema`, so it uses your Claude Code login (your subscription). If `ANTHROPIC_API_KEY` is set, Claude Code bills that key instead. Claude Code enforces the schema itself, and pydantic validates the result. Under a subscription, the run records `"billing": "subscription"`, leaves `cost` empty and puts the list-price figure in `notional_cost`. The full grid then uses up subscription quota, not money.
 
-By default, Kimi Linear goes through Hugging Face's router to Featherless AI, its only listed host (OpenRouter no longer lists it). Featherless doesn't publish a context limit for it, so `context_length` is set to 131072: raise it if full-length filings fit, or lower it if the 128k cells fail. Claude Sonnet 5.5 and Claude Sonnet 5.5 and the judge (Claude Haiku 5.5) go through Claude Code. The judge is a different Claude model from the one under test, so Claude never grades its own answers.
+By default, both Qwen models go through Hugging Face's router to DeepInfra, which serves 262k tokens of context. The `:deepinfra` suffix pins the provider, so results don't drift between hosts. To run Kimi Linear once a host serves it, add `moonshotai/Kimi-Linear-48B-A3B-Instruct` with that host's suffix (Hugging Face listed Featherless AI, which returned "at capacity" in November 2026). Claude Sonnet 5.5 and the judge (Claude Haiku 5.5) go through Claude Code. The judge is a different Claude model from the one under test, so Claude never grades its own answers.
 
 A LiteLLM gateway, for local models, is an OpenAI-compatible entry. The `model` is the gateway's model name, and `context_length` is what the gateway reports as `max_input_tokens`:
 
@@ -68,7 +75,7 @@ There are four panels: exact or tolerant, crossed with real or planted, with the
 
 - **Depth** is where the fact sits in the text that was sent, as a fraction of its length. For planted facts, that is where they were inserted. For a real exact field, it is the first place the value is printed. For a real tolerant field, it is where the section starts.
 - Real facts only count when they are inside the context that was sent. At 8k, most financial figures are cut off. Real facts also cluster: cover-page items near 0%, the financial statements around 60–80%. **Use the planted panels for clean depth curves** and the real panels to check that the effect holds on real content.
-- The post's claim predicts this: the exact panels fade for Kimi Linear as length grows or as facts sit deeper, while the tolerant panels stay flat for both models.
+- The post's claim predicts this: the exact panels fade for the hybrid as length grows or as facts sit deeper, while the tolerant panels stay flat for both models.
 
 ## Files
 
