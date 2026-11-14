@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import time
 
 import httpx
 import instructor
@@ -48,16 +49,26 @@ def model_cfg(name: str) -> dict:
     return cfg
 
 
-_catalogue = {}
+_catalogue = {}  # base_url -> {model id: listing entry}
 
 
 def catalogue(cfg: dict) -> dict:
-    """OpenRouter's public model entry (context length, pricing), or {} for other endpoints."""
-    if "openrouter.ai" not in cfg.get("base_url", ""):
+    """The public model listing's entry (context length, pricing per token) for OpenRouter or the Hugging Face
+    router, or {} for other endpoints."""
+    base = cfg.get("base_url", "")
+    if "openrouter.ai" not in base and "router.huggingface.co" not in base:
         return {}
-    if not _catalogue:
-        _catalogue.update({m["id"]: m for m in httpx.get(cfg["base_url"] + "/models", timeout=30).json()["data"]})
-    return _catalogue.get(cfg["model"], {})
+    if base not in _catalogue:
+        _catalogue[base] = {m["id"]: m for m in httpx.get(base + "/models", timeout=30).json()["data"]}
+    if "openrouter.ai" in base:
+        return _catalogue[base].get(cfg["model"], {})
+    model, _, provider = cfg["model"].partition(":")  # "org/model:deepinfra" pins the provider
+    p = next((p for p in _catalogue[base].get(model, {}).get("providers", []) if p["provider"] == provider), None)
+    if not p:
+        return {}
+    price = p.get("pricing")  # $ per million tokens; OpenRouter's shape is $ per token
+    return {"context_length": p.get("context_length")} | (
+        {"pricing": {"prompt": price["input"] / 1e6, "completion": price["output"] / 1e6}} if price else {})
 
 
 def context_limit(cfg: dict) -> int:
@@ -92,8 +103,10 @@ def call_claude_code(cfg: dict, messages: list[dict], response_model: type[BaseM
 
 
 def call(cfg: dict, messages: list[dict], response_model: type[BaseModel]) -> tuple[dict, dict]:
+    t = time.perf_counter()
     if cfg.get("provider") == "claude-code":
-        return call_claude_code(cfg, messages, response_model)
+        out, meta = call_claude_code(cfg, messages, response_model)
+        return out, meta | {"latency_s": round(time.perf_counter() - t, 3)}
     key = os.environ.get(cfg["api_key_env"])
     if not key:
         raise RuntimeError(f"Set {cfg['api_key_env']} for {cfg['name']}")
@@ -102,12 +115,16 @@ def call(cfg: dict, messages: list[dict], response_model: type[BaseModel]) -> tu
     obj, completion = client.chat.completions.create_with_completion(
         model=cfg["model"], messages=messages, response_model=response_model, max_retries=2,
         temperature=0, max_tokens=4096, extra_body=extra)
-    usage = completion.usage
+    latency, usage = round(time.perf_counter() - t, 3), completion.usage
+    cost = (usage.model_extra or {}).get("cost") if usage else None
+    price = catalogue(cfg).get("pricing")
+    if cost is None and usage and price:  # the Hugging Face router reports tokens but no cost
+        cost = usage.prompt_tokens * float(price["prompt"]) + usage.completion_tokens * float(price["completion"])
     return obj.model_dump(), {
         "provider": getattr(completion, "provider", None),
         "prompt_tokens": usage.prompt_tokens if usage else None,
         "completion_tokens": usage.completion_tokens if usage else None,
-        "cost": (usage.model_extra or {}).get("cost") if usage else None,
+        "cost": cost, "latency_s": latency,
     }
 
 

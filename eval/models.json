@@ -28,9 +28,10 @@
     "context_length": 1000000
   },
   "judge_check": {
-    "name": "Judge check (Claude Sonnet 5.5)",
-    "provider": "claude-code",
-    "model": "claude-sonnet-5-5",
-    "context_length": 1000000
+    "name": "Judge check (DeepSeek-V4-Flash)",
+    "base_url": "https://router.huggingface.co/v1",
+    "api_key_env": "HF_TOKEN",
+    "model": "deepseek-ai/DeepSeek-V4-Flash:deepinfra",
+    "context_length": 1048576
   }
 }

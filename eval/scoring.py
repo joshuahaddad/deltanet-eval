@@ -1,7 +1,8 @@
-"""Scoring: number and date parsing, exact match, outcomes, locating facts, Wilson intervals and agreement."""
+"""Scoring: number and date parsing, exact match, outcomes, stems, locating facts, intervals and agreement."""
 
 import datetime as dt
 import math
+import random
 import re
 
 
@@ -87,15 +88,22 @@ def near_miss(answer, truth, typ: str) -> bool:
     return 1 <= edit_distance(str(answer).strip().strip(".").upper(), str(truth).upper()) <= 2
 
 
-OUTCOMES = ("correct", "near_miss", "wrong", "abstained")
+OUTCOMES = ("correct", "decoy", "near_miss", "wrong", "abstained")
 
 
-def outcome(answer, truth, typ: str) -> str:
+def outcome(answer, truth, typ: str, decoy=None) -> str:
     if answer is None or str(answer).strip().lower() in ("", "null", "none", "n/a"):
         return "abstained"
     if exact_match(answer, truth, typ):
         return "correct"
+    if decoy is not None and exact_match(answer, decoy, typ):
+        return "decoy"  # the lookalike planted elsewhere: retrieval found the wrong paragraph
     return "near_miss" if near_miss(answer, truth, typ) else "wrong"
+
+
+def has_stems(answer, stems: list[str]) -> bool:
+    """A planted tolerant answer is correct when it contains every stem ("a|b" accepts either); no judge needed."""
+    return isinstance(answer, str) and all(any(alt in answer.lower() for alt in s.split("|")) for s in stems)
 
 
 def wilson(ok: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -115,6 +123,17 @@ def agreement(a: list[bool], b: list[bool]) -> dict:
     pe = pa * pb + (1 - pa) * (1 - pb)
     # both judges giving one verdict to everything leaves kappa undefined
     return {"n": n, "agreement": po, "kappa": None if pe == 1 else (po - pe) / (1 - pe)}
+
+
+def bootstrap_mean(values: list[float], n: int = 2000, seed: int = 0) -> dict:
+    """Mean of paired differences with a 95% percentile bootstrap interval.
+    shortcut: resamples items, not filings, so within-filing correlation narrows the interval; with only 7 filings
+    a cluster bootstrap would be too coarse. Upgrade to resampling filings once there are a few dozen."""
+    if not values:
+        return {"est": None, "lo": None, "hi": None, "n": 0}
+    rng, k = random.Random(seed), len(values)
+    means = sorted(sum(rng.choices(values, k=k)) / k for _ in range(n))
+    return {"est": sum(values) / k, "lo": means[int(0.025 * n)], "hi": means[min(n - 1, int(0.975 * n))], "n": k}
 
 
 def renderings(truth, typ: str) -> list[str]:

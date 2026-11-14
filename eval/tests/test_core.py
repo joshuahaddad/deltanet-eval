@@ -112,32 +112,50 @@ def _fake_run():
     q = lambda field, kind, source, depth, correct, **kw: {
         "field": field, "kind": kind, "source": source, "depth": depth, "question": "?", "truth": "t", "answer": "a",
         "correct": correct, "present": depth is not None} | kw
+    r = lambda mode, length, fields, **kw: {"model": "M", "ticker": "AAPL", "fy": 2024, "mode": mode, "length": length,
+                                           "fields": fields} | kw
     return {"id": "test-run", "preset": "smoke", "judge": "j", "status": "done", "total_cost": 0.0,
             "filings": [{"ticker": "AAPL", "fy": 2024}], "models": [{"name": "M", "model": "m/x", "base_url": "u"}],
             "results": [
-                {"model": "M", "ticker": "AAPL", "fy": 2024, "length": 8192, "fields": [
+                r("batched", 8192, [
                     q("a", "exact", "planted", 0.5, True, outcome="correct"),
-                    q("b", "exact", "planted", 0.1, False, outcome="near_miss"),
+                    q("b", "exact", "planted", 0.1, False, outcome="decoy"),
                     q("c", "exact", "real", None, False, outcome="wrong"),  # not in the context: a hallucination
                     q("e", "exact", "real", None, False, outcome="abstained"),  # not in the context, rightly null
-                    q("d", "tolerant", "planted", 0.5, True)]},
-                {"model": "M", "ticker": "AAPL", "fy": 2024, "length": "full", "error": "boom",
-                 "fields": [q("a", "exact", "planted", 0.5, None)]}]}
+                    q("f", "exact", "real", 0.2, True, outcome="correct"),  # known closed-book too
+                    q("g", "exact", "real", 0.6, False, outcome="wrong"),
+                    q("d", "tolerant", "planted", 0.5, True)], latency_s=2.0, cost=0.02),
+                r("single", 8192, [q("a", "exact", "planted", 0.5, False, outcome="near_miss")], latency_s=1.0,
+                  cost=0.01),
+                r("closed_book", None, [q("f", "exact", "real", None, True, outcome="correct"),
+                                        q("g", "exact", "real", None, False, outcome="abstained")], latency_s=0.5),
+                r("batched", "full", [q("a", "exact", "planted", 0.5, None)], error="boom")]}
 
 
 def test_accuracy_metrics():
     m = runs.accuracy_metrics(_fake_run()["results"])
-    lo, hi = scoring.wilson(1, 2)
-    assert m == {"acc/exact_planted": 0.5, "acc/exact_planted/8k": 0.5, "acc/tolerant_planted": 1.0,
-                 "acc/tolerant_planted/8k": 1.0, "n/exact_planted": 2, "n/exact_planted/8k": 2,
-                 "n/tolerant_planted": 1, "n/tolerant_planted/8k": 1,
-                 "acc_lo/exact_planted": lo, "acc_hi/exact_planted": hi,
-                 "acc_lo/exact_planted/8k": lo, "acc_hi/exact_planted/8k": hi,
-                 "acc_lo/tolerant_planted": scoring.wilson(1, 1)[0], "acc_hi/tolerant_planted": 1.0,
-                 "acc_lo/tolerant_planted/8k": scoring.wilson(1, 1)[0], "acc_hi/tolerant_planted/8k": 1.0,
-                 "outcome/exact_planted/correct": 0.5, "outcome/exact_planted/near_miss": 0.5,
-                 "outcome/exact_planted/wrong": 0.0, "outcome/exact_planted/abstained": 0.0,
-                 "halluc/exact_real": 0.5, "n/absent_exact_real": 2}
+    assert m["acc/batched/exact_planted"] == m["acc/exact_planted"] == m["acc/batched/exact_planted/8k"] == 0.5
+    assert m["n/exact_planted/8k"] == 2 and (m["acc_lo/exact_planted"], m["acc_hi/exact_planted"]) == scoring.wilson(1, 2)
+    assert m["acc/batched/exact_planted/d50"] == 1.0 and m["acc/batched/exact_planted/d10"] == 0.0  # pooled depth bins
+    assert m["acc/single/exact_planted"] == 0.0 and m["acc/single/exact_planted/8k"] == 0.0
+    assert "acc/exact_planted/d50" not in m  # only the old names are aliased
+    assert m["acc/batched/tolerant_planted"] == 1.0 and m["acc/tolerant_planted"] == 1.0
+    assert m["acc/batched/exact_real"] == 0.5 and m["acc/closed_book/exact_real"] == 0.5
+    assert m["acc/batched/exact_real_unmemorised"] == 0.0 and m["n/batched/exact_real_unmemorised"] == 1  # f dropped
+    assert m["outcome/batched/exact_planted/decoy"] == m["outcome/exact_planted/decoy"] == 0.5
+    assert m["outcome/single/exact_planted/near_miss"] == 1.0 and "outcome/exact_planted/near_miss" in m
+    assert m["outcome/closed_book/exact_real/abstained"] == 0.5
+    assert m["halluc/exact_real"] == 0.5 and m["n/absent_exact_real"] == 2  # batched only: closed book is not counted
+    assert m["calls_failed/batched"] == 1 and m["calls_failed/single"] == 0
+    assert m["latency_s_median/batched"] == 2.0 and m["latency_s_median/closed_book"] == 0.5
+    assert m["notional_cost_usd/batched"] == pytest.approx(0.02)
+    assert m["cost_per_correct/batched"] == pytest.approx(0.02 / 3) and "cost_per_correct/single" not in m
+
+
+def test_accuracy_metrics_old_run():  # results from before call modes count as batched
+    old = [{k: v for k, v in r.items() if k != "mode"} for r in _fake_run()["results"][:1]]
+    m = runs.accuracy_metrics(old)
+    assert m["acc/exact_planted"] == 0.5 and "acc/batched/exact_real_unmemorised" not in m
 
 
 def test_wilson():
@@ -205,7 +223,8 @@ def test_build_context_tolerant_reference_and_depth():
     q = next(q for q in context.build_context(filing, 8192)[1] if q["field"] == "seasonality")
     assert q["depth"] is None and q["truth"] == ""  # cut off entirely
     # cut inside the passage: the reference is only what was sent, and under half of it counts as absent
-    plant_tokens = sum(context.n_tokens(p["paragraph"]) + 2 for p in context.planted_facts("T-2024") if "paragraph" in p)
+    plant_tokens = sum(context.n_tokens(p[k]) + 2 for p in context.planted_facts("T-2024")
+                       for k in ("paragraph", "decoy_paragraph") if k in p)
     sent = len(context.truncate(filing["text"], 8192 - context.RESERVE - plant_tokens))
     starts = [m.start() for m in re.finditer("^", filing["text"], re.M)]
     for keep, present in ((0.8, True), (0.3, False)):
@@ -227,13 +246,13 @@ def test_judge_check(monkeypatch):
     run["results"][0]["fields"] += [tol(f"t{i}", i % 2 == 0) for i in range(10)] + [
         tol("blank", False) | {"answer": None}, tol("absent", False) | {"present": False, "depth": None}]
     sample = runs.judge_check_sample(run)
-    assert len(sample) == 11 and sample == runs.judge_check_sample(run)  # graded answers only, same every time
+    assert len(sample) == 10 and sample == runs.judge_check_sample(run)  # graded real answers only, same every time
     monkeypatch.setitem(llm.CONFIG, "judge_check", {"name": "J2", "model": "j2"})
     monkeypatch.setattr(runs, "judge", lambda q, ref, a, cfg: (True, {"reason": "ok", "cost": 0}))
     jc = runs.judge_check(run)
-    assert jc["sampled"] == 11 and jc["errors"] == 0 and jc["judge"] == "j2"
+    assert jc["sampled"] == 10 and jc["errors"] == 0 and jc["judge"] == "j2"
     first = [i["first"] for i in jc["items"]]
-    assert jc["agreement"] == pytest.approx(sum(first) / 11) and jc["kappa"] == 0  # no better than chance
+    assert jc["agreement"] == pytest.approx(sum(first) / 10) and jc["kappa"] == 0  # no better than chance
 
 
 def test_log_mlflow(tmp_path, monkeypatch):
@@ -244,6 +263,7 @@ def test_log_mlflow(tmp_path, monkeypatch):
     c = MlflowClient()
     child = c.search_runs([c.get_run(rid).info.experiment_id], f"tags.mlflow.parentRunId = '{rid}'")[0]
     assert child.data.metrics["acc/exact_planted"] == 0.5 and child.data.metrics["calls_failed"] == 1
+    assert child.data.metrics["acc/single/exact_planted/8k"] == 0.0
     assert {a.path for a in c.list_artifacts(child.info.run_id)} == {"answers.csv", "calls.json"}
     assert "run.json" in {a.path for a in c.list_artifacts(rid)}
 
@@ -333,3 +353,143 @@ def test_log_mlflow_icl(tmp_path, monkeypatch):
     assert child.data.metrics["icl_acc/banking77/32k"] == pytest.approx(2 / 3) and child.data.metrics["calls_failed"] == 1
     assert {a.path for a in c.list_artifacts(child.info.run_id)} == {"answers.csv", "calls.json"}
     assert c.get_run(rid).data.params["mode"] == "icl"
+
+
+def test_decoys_placed_apart():
+    facts = context.planted_facts("AAPL-2024")
+    codes = [f for f in facts if f["kind"] == "exact"]
+    real = {f["target"] for f in codes}
+    for n, f in enumerate(codes):
+        d = context.DEPTHS[(n // context.PLANTS_PER_DEPTH + 2) % len(context.DEPTHS)]  # 0.1 -> 0.5, 0.7 -> 0.1, ...
+        assert abs(f["decoy_target"] - d) < 0.04 and int(f["decoy_target"] * 5) == int(d * 5)
+        assert min(abs(f["decoy_target"] - t) for t in real) >= 0.01 - 1e-9 and f["decoy"] != f["truth"]
+    filing = {"ticker": "T", "fy": 2024, "truths": {},
+              "text": "\n".join(f"Line {i} of the filing body." for i in range(20000))}
+    ctx, qs = context.build_context(filing, 8192)
+    assert context.n_tokens(ctx) <= 8192
+    for q in qs:
+        if "decoy" in q:
+            assert abs(q["decoy_depth"] - q["decoy_target"]) < 0.01 and f": {q['decoy']}. " in ctx
+            assert "decoy_paragraph" not in q and "paragraph" not in q
+
+
+def test_decoy_outcome():
+    assert scoring.outcome("ZK-11111-2", "QX-48213-7", "code", decoy="ZK-11111-2") == "decoy"
+    assert scoring.outcome("QX-48213-7", "QX-48213-7", "code", decoy="QX-48213-7") == "correct"  # correct wins
+    assert scoring.outcome("QX-48213-1", "QX-48213-7", "code", decoy="ZK-11111-2") == "near_miss"
+
+
+def test_stems():
+    for i, (_, statement, *_, stems) in enumerate(context.PLANTS):
+        assert scoring.has_stems(statement, stems) and scoring.has_stems(statement.upper(), stems)
+        assert not scoring.has_stems("I don't know.", stems) and not scoring.has_stems(None, stems)
+        for j, other in enumerate(context.PLANTS):  # another plant's answer is wrong here
+            assert i == j or not scoring.has_stems(other[1], stems), (i, j)
+    assert scoring.has_stems("Flood insurance got too expensive.", ["flood", "insur"])
+
+
+def _fake_filing(ticker="T", fy=2024):
+    lines = [f"Line {i} of the filing body." for i in range(20000)]
+    lines[5] = "For the fiscal year ended September 28, 2024."
+    return {"ticker": ticker, "fy": fy, "url": f"u/{ticker}", "accn": "a", "period_end": "2024-09-28",
+            "text": "\n".join(lines),
+            "truths": {"fiscal_year_end": {"question": "On what date did fiscal year 2024 end?", "type": "date",
+                                           "truth": "2024-09-28"}}}
+
+
+def test_plan_modes(monkeypatch):
+    monkeypatch.setattr(runs, "get_filing", _fake_filing)
+    monkeypatch.setitem(runs.PRESETS["full"], "filings", [["T", 2024]])
+    tasks = runs.plan("full")
+    for cfg in llm.CONFIG["models"]:
+        mine = [t for t in tasks if t[2] is cfg]
+        lengths = [32768] if cfg.get("provider") == "claude-code" else [8192, 32768, 131072]
+        assert [t for t in mine if t[3] == "closed_book"] == [(mine[0][0], None, cfg, "closed_book", None)]
+        assert sorted(t[1] for t in mine if t[3] == "batched") == lengths
+        assert len([t for t in mine if t[3] == "single"]) == 30 * len(lengths)  # every planted question
+    smoke = runs.plan("smoke")
+    assert sorted((t[3], t[4]) for t in smoke if t[2] is llm.CONFIG["models"][0]) == [
+        ("batched", None), ("closed_book", None), ("single", "planted_code_50b"), ("single", "planted_note_50b")]
+
+
+def test_score_task_modes(monkeypatch):
+    monkeypatch.setattr(runs, "_contexts", {})
+    filing, cfg, seen = _fake_filing(), {"name": "M", "model": "m"}, []
+    facts = {f["field"]: f for f in context.planted_facts("T-2024")}
+
+    def fake_extract(cfg, doc, schema, **kw):
+        seen.append((doc, sorted(schema["properties"]), kw))
+        return {"fiscal_year_end": "September 28, 2024", "planted_code_50b": facts["planted_code_50b"]["decoy"],
+                "planted_note_50b": "The collector put its fees up twice."}, {"latency_s": 1.5}
+    monkeypatch.setattr(runs, "extract", fake_extract)
+    fields = ["fiscal_year_end", "planted_code_50b", "planted_note_50b"]
+    b = runs.score_task(filing, 8192, cfg, "batched", None, fields)
+    assert b["mode"] == "batched" and b["latency_s"] == 1.5 and seen[-1][1] == sorted(fields)
+    got = {q["field"]: q for q in b["fields"]}
+    assert got["fiscal_year_end"]["correct"] and got["planted_code_50b"]["outcome"] == "decoy"
+    assert got["planted_note_50b"]["correct"]  # stems, not the judge
+    s = runs.score_task(filing, 8192, cfg, "single", "planted_code_50b", fields)
+    assert s["mode"] == "single" and seen[-1][1] == ["planted_code_50b"] and seen[-1][0] == seen[0][0]
+    c = runs.score_task(filing, 8192, cfg, "closed_book", None, fields)
+    assert c["mode"] == "closed_book" and c["length"] is None and c["context_tokens"] == 0
+    assert seen[-1][0] == "" and seen[-1][1] == ["fiscal_year_end"] and seen[-1][2]["system"] == runs.CLOSED_BOOK
+    assert c["fields"][0]["depth"] is None and c["fields"][0]["correct"]
+    assert "answer" not in runs.context_for(filing, 8192)[1][0]  # the cached questions are not mutated
+    monkeypatch.setattr(runs, "extract", lambda *a, **kw: 1 / 0)
+    assert "ZeroDivisionError" in runs.score_task(filing, 8192, cfg, "single", "planted_code_50b", fields)["error"]
+
+
+def test_bootstrap_mean():
+    assert scoring.bootstrap_mean([1, 1, 1]) == {"est": 1.0, "lo": 1.0, "hi": 1.0, "n": 3}
+    assert scoring.bootstrap_mean([])["est"] is None
+    r = scoring.bootstrap_mean([1] * 30 + [0] * 70)
+    assert r == scoring.bootstrap_mean([1] * 30 + [0] * 70) and r["est"] == pytest.approx(0.3)
+    assert 0.19 < r["lo"] < 0.3 < r["hi"] < 0.41  # about 0.3 +- 1.96 * sqrt(0.21 / 100)
+
+
+def test_paired():
+    q = lambda field, correct: {"field": field, "correct": correct}
+    r = lambda model, length, fields, mode="single", **kw: {"model": model, "ticker": "T", "fy": 2024,
+                                                            "length": length, "mode": mode, "fields": fields} | kw
+    results = []
+    for length in (8192, 32768):
+        for i in range(10):  # A gets every code, B half; both get every note
+            results += [r("A", length, [q(f"planted_code_{i}", True)]), r("B", length, [q(f"planted_code_{i}", i < 5)]),
+                        r("A", length, [q(f"planted_note_{i}", True)]), r("B", length, [q(f"planted_note_{i}", True)])]
+    results += [r("A", 8192, [q("revenue", False)], "batched"), r("C", 8192, [q("planted_code_0", True)], error="x")]
+    out = runs.paired(results)
+    assert [(p["a"], p["b"], p["length"]) for p in out] == [("A", "B", "8k"), ("A", "B", "32k"), ("A", "B", "all")]
+    pooled = out[-1]
+    assert pooled["exact_gap"]["est"] == 0.5 and pooled["exact_gap"]["n"] == 20
+    assert pooled["tolerant_gap"] == {"est": 0.0, "lo": 0.0, "hi": 0.0, "n": 20}
+    assert pooled["did"]["est"] == 0.5 and pooled["did"]["lo"] < 0.5 < pooled["did"]["hi"]
+
+
+def test_hf_router_catalogue(monkeypatch):
+    listing = {"data": [{"id": "Qwen/Q", "providers": [
+        {"provider": "other", "pricing": {"input": 9, "output": 9}},
+        {"provider": "deepinfra", "context_length": 262144, "pricing": {"input": 0.09, "output": 1.1}}]}]}
+    calls = []
+    monkeypatch.setattr(llm, "_catalogue", {})
+    monkeypatch.setattr(llm.httpx, "get", lambda url, **kw: calls.append(url) or type("R", (), {"json": lambda s: listing})())
+    cfg = {"base_url": "https://router.huggingface.co/v1", "model": "Qwen/Q:deepinfra"}
+    got = llm.catalogue(cfg)
+    assert got["context_length"] == 262144 and got["pricing"]["prompt"] == pytest.approx(0.09e-6)
+    assert got["pricing"]["completion"] == pytest.approx(1.1e-6)
+    assert llm.catalogue(cfg | {"model": "Qwen/Q:missing"}) == {} and llm.catalogue(cfg | {"model": "No/Such"}) == {}
+    assert calls == ["https://router.huggingface.co/v1/models"]  # fetched once
+    assert llm.catalogue({"base_url": "https://example.com/v1", "model": "x"}) == {}
+
+
+def test_stems_accept_alternatives():
+    from scoring import has_stems
+    assert has_stems("The logs were hard to read.", ["legib|hard to read|unread"])
+    assert not has_stems("They wanted new badges.", ["legib|hard to read|unread"])
+
+
+def test_paired_order_follows_models_json(monkeypatch):
+    monkeypatch.setattr(runs, "CONFIG", {"models": [{"name": "A"}, {"name": "B"}]})
+    res = [{"model": m, "mode": "single", "ticker": "T", "fy": 2024, "length": 8192,
+            "fields": [{"field": "planted_code_10a", "correct": m == "A"}]} for m in ("B", "A")]
+    out = runs.paired(res)
+    assert out[0]["a"] == "A" and out[0]["exact_gap"]["est"] == 1

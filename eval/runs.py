@@ -1,26 +1,31 @@
 """Runs: presets, planning and cost estimates, scoring a call, the run and judge-check lifecycle, and MLflow."""
 
 import datetime as dt
+import itertools
 import json
 import os
 import random
+import re
+import statistics
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import icl
-from context import RESERVE, build_context, n_tokens
+from context import DEPTHS, RESERVE, build_context, n_tokens, planted_facts
 from edgar import get_filing
 from llm import CONFIG, catalogue, context_limit, extract, judge
 from paths import HERE, RUNS
-from scoring import OUTCOMES, agreement, exact_match, outcome, wilson
+from scoring import OUTCOMES, agreement, bootstrap_mean, exact_match, has_stems, outcome, wilson
 
 PRESETS = {
+    # every call mode once per model: closed book, batched, and a single call per planted question
     "smoke": {"filings": [["AAPL", 2024]], "lengths": [8192],
-              "fields": ["fiscal_year_end", "planted_code_50b", "planted_note_50b"]},
-    # 45k to 208k tokens, so the 128k column is real; BAC's full length still fits a 262k window
+              "fields": ["fiscal_year_end", "revenue", "planted_code_50b", "planted_note_50b"]},
+    # 45k to 208k tokens, so the 128k column is real; lengths may also hold "full" (the whole filing, if it fits)
     "full": {"filings": [["AAPL", 2024], ["MSFT", 2024], ["GE", 2024], ["KO", 2024], ["F", 2024], ["PFE", 2024],
                          ["BAC", 2024]],
-             "lengths": [8192, 16384, 32768, 65536, 131072, "full"], "fields": None},
+             "lengths": [8192, 32768, 131072], "fields": None,
+             "model_lengths": {"claude-code": [32768]}},  # Claude runs on subscription quota
     # HELMET many-shot ICL: one call per test item; model_lengths limits a model (by name or provider) to some lengths
     "icl-smoke": {"mode": "icl", "datasets": ["banking77"], "lengths": [32768], "items": 5},
     "icl": {"mode": "icl", "datasets": ["banking77", "clinc150"], "lengths": [32768, 65536, 131072], "items": 50,
@@ -33,9 +38,10 @@ def model_lengths(p: dict, cfg: dict) -> list:
     return allowed.get(cfg["name"], allowed.get(cfg.get("provider"), p["lengths"]))
 
 
-def plan(preset: str) -> list[tuple[dict, int | None, dict]]:
-    """Every (filing, budget, model) call in a preset, or (dataset, length, model, test item) for ICL.
-    Skips lengths past the filing or the model's window."""
+def plan(preset: str) -> list[tuple]:
+    """Every call in a preset: (filing, budget, model, mode, field), or (dataset, length, model, test item) for ICL.
+    Per filing and length a model gets one batched call and one single call per planted question, plus one
+    closed-book call per filing. Skips lengths past the filing or the model's window."""
     p = PRESETS[preset]
     if p.get("mode") == "icl":
         return [(name, length, cfg, item) for name in p["datasets"] for item in icl.test_items(name, p["items"])
@@ -44,22 +50,39 @@ def plan(preset: str) -> list[tuple[dict, int | None, dict]]:
     for ticker, fy in p["filings"]:
         filing = get_filing(ticker, fy)
         full = n_tokens(filing["text"]) + RESERVE + 500
+        planted = [q["field"] for q in planted_facts(f"{filing['ticker']}-{filing['fy']}")
+                   if not p["fields"] or q["field"] in p["fields"]]
         for cfg in CONFIG["models"]:
-            for length in model_lengths(p, cfg):
-                if length == "full":
-                    if full <= context_limit(cfg):
-                        tasks.append((filing, None, cfg))
-                elif length < full and length <= context_limit(cfg):
-                    tasks.append((filing, length, cfg))
+            budgets = [None if length == "full" else length for length in model_lengths(p, cfg)
+                       if (full if length == "full" else length) <= context_limit(cfg) and (length == "full" or length < full)]
+            if budgets:
+                tasks.append((filing, None, cfg, "closed_book", None))
+            for b in budgets:  # real questions stay batched only: single calls for them would multiply the cost
+                tasks += [(filing, b, cfg, "batched", None)] + [(filing, b, cfg, "single", f) for f in planted]
     return tasks
 
 
+_contexts, _contexts_lock = {}, threading.Lock()
+
+
+def context_for(filing: dict, budget: int | None) -> tuple[str, list[dict], int]:
+    """build_context once per filing and budget: every mode and model at one length sends the same context."""
+    key = (filing["ticker"], filing["fy"], budget)
+    with _contexts_lock:
+        if key not in _contexts:
+            ctx, qs = build_context(filing, budget)
+            _contexts[key] = ctx, qs, n_tokens(ctx)
+        return _contexts[key]
+
+
 ICL_OVERHEAD = 300  # instruction, schema and Instructor's wrapper, beyond the demos and the question
+CALL_TOKENS = {"batched": (1500, 1500), "single": (300, 100), "closed_book": (600, 400)}  # (overhead in, out)
 
 
 def estimate(preset: str) -> dict:
-    p, cost, unknown, tokens, prompts = PRESETS[preset], 0.0, set(), {}, {}
+    p, cost, unknown, tokens, calls, prompts = PRESETS[preset], 0.0, set(), {}, {}, {}
     tasks = plan(preset)
+    jp = None if p.get("mode") == "icl" else catalogue(CONFIG["judge"]).get("pricing")
     for task in tasks:
         cfg = task[2]
         if p.get("mode") == "icl":
@@ -70,28 +93,51 @@ def estimate(preset: str) -> dict:
                 prompts[key] = n_tokens(pr["context"] + pr["question"]) + ICL_OVERHEAD
             sent, out = prompts[key], 30
         else:
-            ctx, qs = build_context(task[0], task[1], p["fields"])
-            jp = catalogue(CONFIG["judge"]).get("pricing")
-            if jp:
-                cost += sum(n_tokens(q["truth"]) + 500 for q in qs if q["kind"] == "tolerant") * float(jp["prompt"])
-            sent, out = n_tokens(ctx) + 1500, 1500
+            filing, budget, _, mode, _ = task
+            over, out = CALL_TOKENS[mode]
+            if mode == "closed_book":
+                sent = over
+            else:
+                _, qs, ntok = context_for(filing, budget)
+                sent = ntok + over
+                if jp and mode == "batched":  # the judge grades real tolerant answers only
+                    cost += sum(n_tokens(q["truth"]) + 500 for q in qs if q["kind"] == "tolerant" and q["source"] == "real"
+                                and (not p["fields"] or q["field"] in p["fields"])) * float(jp["prompt"])
         tokens[cfg["name"]] = tokens.get(cfg["name"], 0) + sent
+        calls[cfg["name"]] = calls.get(cfg["name"], 0) + 1
         price = catalogue(cfg).get("pricing")
         if not price:
             unknown.add(cfg["name"] + (" (Claude Code)" if cfg.get("provider") == "claude-code" else ""))
             continue
         cost += sent * float(price["prompt"]) + out * float(price["completion"])
     return {"preset": preset, "calls": len(tasks), "usd": round(cost, 4), "unpriced_models": sorted(unknown),
-            "input_tokens": tokens}
+            "input_tokens": tokens, "calls_per_model": calls}
 
 
-def score_task(filing: dict, budget: int | None, cfg: dict, fields: list[str] | None) -> dict:
-    ctx, qs = build_context(filing, budget, fields)
+CLOSED_BOOK = (
+    "You answer questions about a company's SEC 10-K filing from memory; the filing is not shown. "
+    "For amounts, give the value as written in the filing, including the scale (for example '$391,035 million' or "
+    "'$6.08'). For dates, give the full date. Use null if you do not know the answer."
+)
+
+
+def score_task(filing: dict, budget: int | None, cfg: dict, mode: str, field: str | None,
+               fields: list[str] | None) -> dict:
+    ctx, qs, ntok = context_for(filing, budget)
+    if mode == "closed_book":  # nothing sent, so every real question counts as absent from the context
+        ctx, ntok, qs = "", 0, [q | {"depth": None} for q in qs if q["source"] == "real"]
+    qs = [dict(q) for q in qs if (not fields or q["field"] in fields) and (mode != "single" or q["field"] == field)]
     res = {"model": cfg["name"], "model_id": cfg["model"], "ticker": filing["ticker"], "fy": filing["fy"],
-           "length": budget or "full", "context_tokens": n_tokens(ctx), "fields": qs}
+           "mode": mode, "length": None if mode == "closed_book" else budget or "full", "context_tokens": ntok,
+           "fields": qs}
     schema = {"type": "object", "properties": {q["field"]: {"type": "string", "description": q["question"]} for q in qs}}
     try:
-        answers, meta = extract(cfg, ctx, schema)
+        if mode == "closed_book":  # the default instruction says "from the document only", which would force null
+            answers, meta = extract(cfg, ctx, schema, system=CLOSED_BOOK,
+                                    ask=f"The filing is {filing['ticker']}'s 10-K for fiscal year {filing['fy']}. "
+                                        "Answer the fields.")
+        else:
+            answers, meta = extract(cfg, ctx, schema)
     except Exception as e:  # one failed call should not sink the run; the error is shown on the page
         return res | {"error": f"{type(e).__name__}: {e}"}
     res |= meta
@@ -101,8 +147,10 @@ def score_task(filing: dict, budget: int | None, cfg: dict, fields: list[str] | 
         q["present"] = q["depth"] is not None
         if q["kind"] == "exact":
             q["correct"] = exact_match(q["answer"], q["truth"], q["type"])
-            q["outcome"] = outcome(q["answer"], q["truth"], q["type"])
-        elif q["present"]:
+            q["outcome"] = outcome(q["answer"], q["truth"], q["type"], q.get("decoy"))
+        elif q["source"] == "planted":
+            q["correct"] = has_stems(q["answer"], q["stems"])
+        elif q["present"]:  # closed-book tolerant answers are recorded but not judged
             try:
                 q["correct"], jm = judge(q["question"], q["truth"], q["answer"])
                 q["judge_reason"] = jm.get("reason")
@@ -152,15 +200,20 @@ def start_run(preset: str) -> str:
                                    for n in p["datasets"]]
             else:
                 run["filings"] = list({f["url"]: {k: f[k] for k in ("ticker", "fy", "accn", "url", "period_end")}
-                                       | {"full_tokens": n_tokens(f["text"])} for f, _, _ in tasks}.values())
+                                       | {"full_tokens": n_tokens(f["text"])} for f, *_ in tasks}.values())
             save_run(run)
             score = (lambda t: score_icl(*t)) if is_icl else (lambda t: score_task(*t, p["fields"]))
-            with ThreadPoolExecutor(4) as pool:
-                for r in pool.map(score, tasks):
+            # claude -p runs on the local machine and quota, so it keeps a smaller pool than the API models
+            with ThreadPoolExecutor(8) as pool, ThreadPoolExecutor(4) as claude_pool:
+                futures = [(claude_pool if t[2].get("provider") == "claude-code" else pool).submit(score, t)
+                           for t in tasks]
+                for f in as_completed(futures):
                     with lock:
-                        run["results"].append(r)
+                        run["results"].append(f.result())
                         save_run(run)
             run["status"] = "done"
+            if not is_icl:
+                run["paired"] = paired(run["results"])
         except Exception as e:
             run["status"], run["error"] = "error", f"{type(e).__name__}: {e}"
         run["finished"] = dt.datetime.now().isoformat(timespec="seconds")
@@ -176,13 +229,14 @@ def start_run(preset: str) -> str:
     return rid
 
 
-ANSWER_COLUMNS = ["ticker", "fy", "length", "field", "kind", "source", "depth", "question", "truth", "answer",
-                  "correct", "outcome", "judge_reason", "judge_error", "call_error"]
+ANSWER_COLUMNS = ["ticker", "fy", "mode", "length", "field", "kind", "source", "depth", "question", "truth", "decoy",
+                  "answer", "correct", "outcome", "judge_reason", "judge_error", "call_error"]
 
 
 def answer_rows(results: list[dict]) -> list[dict]:
     """One row per question asked: what the model returned, and how it was scored."""
-    return [{"ticker": r["ticker"], "fy": r["fy"], "length": r["length"], "call_error": r.get("error")}
+    return [{"ticker": r["ticker"], "fy": r["fy"], "mode": r.get("mode", "batched"), "length": r["length"],
+             "call_error": r.get("error")}
             | {k: q.get(k) for k in ANSWER_COLUMNS if k in q} for r in results for q in r["fields"]]
 
 
@@ -195,6 +249,10 @@ def icl_rows(results: list[dict]) -> list[dict]:
 
 def length_label(length) -> str:
     return length if length == "full" else f"{length // 1024}k"
+
+
+def depth_label(depth: float) -> str:
+    return f"d{DEPTHS[min(len(DEPTHS) - 1, int(depth * len(DEPTHS)))] * 100:.0f}"  # the heatmap's bins
 
 
 def icl_metrics(results: list[dict]) -> dict:
@@ -212,33 +270,88 @@ def icl_metrics(results: list[dict]) -> dict:
 
 
 def accuracy_metrics(results: list[dict]) -> dict:
-    """The heatmap cells, collapsed: accuracy, its Wilson 95% interval and count per kind x source, overall and per
-    length; exact outcome rates per source; and the hallucination rate on real exact facts absent from the context."""
-    cells, outcomes, absent = {}, {}, [0, 0]
+    """One model's results, per call mode: accuracy with its Wilson 95% interval and count per kind x source,
+    overall, per length and per depth bin pooled over lengths; exact outcome rates (decoy included) per source; the
+    hallucination rate on real exact facts absent from the context; closed-book accuracy, and real exact accuracy
+    without the facts the model knew closed-book; median latency, list-price cost and cost per correct answer.
+    Batched cells also keep their names from before call modes existed (acc/exact_planted, outcome/exact_real/...)."""
+    cells, outcomes, absent, latency, spend, right, failed = {}, {}, [0, 0], {}, {}, {}, {}
+    known = {(r["ticker"], r["fy"], q["field"]) for r in results if r.get("mode") == "closed_book" and not r.get("error")
+             for q in r["fields"] if q.get("correct")}
+    has_closed = any(r.get("mode") == "closed_book" and not r.get("error") for r in results)
     for r in results:
+        mode = r.get("mode", "batched")  # runs from before call modes were all batched
         if r.get("error"):
+            failed[mode] = failed.get(mode, 0) + 1
             continue
-        length = length_label(r["length"])
+        if r.get("latency_s") is not None:
+            latency.setdefault(mode, []).append(r["latency_s"])
+        spend[mode] = spend.get(mode, 0) + (r.get("notional_cost") or r.get("cost") or 0)  # list price, Claude too
         for q in r["fields"]:
-            if q["kind"] == "exact" and q["source"] == "real" and q["depth"] is None and "outcome" in q:
+            if mode == "batched" and q["kind"] == "exact" and q["source"] == "real" and q["depth"] is None \
+                    and "outcome" in q:
                 absent[0] += q["outcome"] != "abstained"  # answered although the fact was not sent
                 absent[1] += 1
-            if q.get("correct") is None or q["depth"] is None:
+            if q.get("correct") is None or (q["depth"] is None and mode != "closed_book"):
                 continue
+            right[mode] = right.get(mode, 0) + bool(q["correct"])
             if "outcome" in q:
-                outcomes.setdefault(q["source"], []).append(q["outcome"])
-            for key in (f"{q['kind']}_{q['source']}", f"{q['kind']}_{q['source']}/{length}"):
+                outcomes.setdefault((mode, q["source"]), []).append(q["outcome"])
+            ks = f"{q['kind']}_{q['source']}"
+            keys = [ks] if mode == "closed_book" else [ks, f"{ks}/{length_label(r['length'])}", f"{ks}/{depth_label(q['depth'])}"]
+            keys = [f"{mode}/{k}" for k in keys] + (keys[:2] if mode == "batched" else [])
+            if has_closed and mode == "batched" and ks == "exact_real" and (r["ticker"], r["fy"], q["field"]) not in known:
+                keys.append("batched/exact_real_unmemorised")
+            for key in keys:
                 ok, n = cells.get(key, (0, 0))
                 cells[key] = (ok + bool(q["correct"]), n + 1)
     m = {}
     for k, (ok, n) in cells.items():
         lo, hi = wilson(ok, n)
         m |= {f"acc/{k}": ok / n, f"acc_lo/{k}": lo, f"acc_hi/{k}": hi, f"n/{k}": n}
-    for source, outs in outcomes.items():
-        m |= {f"outcome/exact_{source}/{o}": outs.count(o) / len(outs) for o in OUTCOMES}
+    for (mode, source), outs in outcomes.items():
+        for o in OUTCOMES:
+            m[f"outcome/{mode}/exact_{source}/{o}"] = outs.count(o) / len(outs)
+            if mode == "batched":
+                m[f"outcome/exact_{source}/{o}"] = outs.count(o) / len(outs)
     if absent[1]:
         m |= {"halluc/exact_real": absent[0] / absent[1], "n/absent_exact_real": absent[1]}
+    for mode in spend.keys() | failed.keys():
+        m[f"calls_failed/{mode}"] = failed.get(mode, 0)
+        if mode in spend:
+            m[f"notional_cost_usd/{mode}"] = spend[mode]
+        if right.get(mode):
+            m[f"cost_per_correct/{mode}"] = spend[mode] / right[mode]
+        if latency.get(mode):
+            m[f"latency_s_median/{mode}"] = statistics.median(latency[mode])
     return m
+
+
+def paired(results: list[dict]) -> list[dict]:
+    """For every model pair, on planted single-call items both answered: the accuracy gap A-B for exact and for
+    tolerant questions, and the difference in differences (exact gap - tolerant gap) pairing each planted code with
+    its note, per length and pooled, each with a paired bootstrap 95% interval. Items pair by ticker, fy, length,
+    field."""
+    ok = {}  # model -> {(ticker, fy, length, field): correct}
+    for r in results:
+        if r.get("mode") == "single" and not r.get("error"):
+            for q in r["fields"]:
+                if q.get("correct") is not None:
+                    ok.setdefault(r["model"], {})[(r["ticker"], r["fy"], r["length"], q["field"])] = bool(q["correct"])
+    out = []
+    order = [m["name"] for m in CONFIG["models"]]  # results arrive in completion order; A is first in models.json
+    for a, b in itertools.combinations(sorted(ok, key=lambda m: order.index(m) if m in order else len(order)), 2):
+        shared = ok[a].keys() & ok[b].keys()
+        for length in sorted({k[2] for k in shared}, key=lambda x: float("inf") if x == "full" else x) + [None]:
+            keys = sorted((k for k in shared if length in (None, k[2])), key=str)
+            diff = {k: ok[a][k] - ok[b][k] for k in keys}
+            did = [diff[k] - diff[n] for k in keys if k[3].startswith("planted_code_")
+                   for n in [k[:3] + (k[3].replace("planted_code_", "planted_note_"),)] if n in diff]
+            out.append({"a": a, "b": b, "length": "all" if length is None else length_label(length),
+                        "exact_gap": bootstrap_mean([d for k, d in diff.items() if k[3].startswith("planted_code_")]),
+                        "tolerant_gap": bootstrap_mean([d for k, d in diff.items() if k[3].startswith("planted_note_")]),
+                        "did": bootstrap_mean(did)})
+    return out
 
 
 def mlflow_uri() -> str:
@@ -267,6 +380,11 @@ def log_mlflow(run: dict) -> str:
                            "filings": ", ".join(f"{f['ticker']} FY{f['fy']}" for f in run.get("filings", []))})
         mlflow.log_metric("total_cost_usd", run["total_cost"])
         mlflow.log_dict(run, "run.json")
+        for pr in run.get("paired", []):  # MLflow names allow letters, digits, _ - . / space only
+            pair = re.sub(r"[^\w\-. /]", "", f"{pr['a']} vs {pr['b']}").replace("/", "-")
+            mlflow.log_metrics({f"paired{x}/{pair}/{stat}/{pr['length']}": pr[stat][y] for stat in
+                                ("exact_gap", "tolerant_gap", "did") if pr[stat]["n"]
+                                for x, y in (("", "est"), ("_lo", "lo"), ("_hi", "hi"))})
         for m in run["models"]:
             results = [r for r in run["results"] if r["model"] == m["name"]]
             with mlflow.start_run(run_name=m["name"], nested=True):
@@ -290,10 +408,12 @@ JUDGE_CHECK_N = 60  # tolerant answers re-graded per check
 
 
 def judge_check_sample(run: dict) -> list[dict]:
-    """A deterministic sample of the tolerant answers the main judge actually graded (blank answers never reach it)."""
+    """A deterministic sample of the real tolerant answers the main judge actually graded (blank answers never reach
+    it; planted ones are scored by stems)."""
     items = sorted(({"model": r["model"], "ticker": r["ticker"], "fy": r["fy"], "length": r["length"]} | q
                     for r in run["results"] if not r.get("error") for q in r["fields"]
-                    if q["kind"] == "tolerant" and q.get("present") and q.get("correct") is not None and q.get("answer")),
+                    if q["kind"] == "tolerant" and q["source"] == "real" and q.get("present")
+                    and q.get("correct") is not None and q.get("answer")),
                    key=lambda q: (q["model"], q["ticker"], q["fy"], str(q["length"]), q["field"]))
     return random.Random(run["id"]).sample(items, min(JUDGE_CHECK_N, len(items)))
 
