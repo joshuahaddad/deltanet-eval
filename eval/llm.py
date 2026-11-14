@@ -111,10 +111,11 @@ def call(cfg: dict, messages: list[dict], response_model: type[BaseModel]) -> tu
     }
 
 
-def extract(cfg: dict, document: str, schema: dict) -> tuple[dict, dict]:
-    """The one extraction path, used by eval and use mode alike."""
-    messages = [{"role": "system", "content": SYSTEM},
-                {"role": "user", "content": f"<document>\n{document}\n</document>\n\nExtract the fields."}]
+def extract(cfg: dict, document: str, schema: dict, system: str = SYSTEM,
+            ask: str = "Extract the fields.") -> tuple[dict, dict]:
+    """The one extraction path, used by the filing eval, the ICL eval and use mode alike."""
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": f"<document>\n{document}\n</document>\n\n{ask}"}]
     return call(cfg, messages, schema_model(schema))
 
 

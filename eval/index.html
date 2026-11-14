@@ -41,6 +41,8 @@
   <div class="row">
     <button id="smoke">Run smoke</button>
     <button id="full">Run full grid…</button>
+    <button id="icl-smoke">Run ICL smoke</button>
+    <button id="icl">Run ICL grid…</button>
     <span id="msg" class="muted"></span>
   </div>
 </section>
@@ -48,11 +50,13 @@
 <section>
   <div class="row"><label for="runs">Run</label> <select id="runs"></select> <span id="runinfo" class="muted"></span></div>
   <div id="heatmaps"></div>
+  <div id="filingonly">
   <h3>Exact answers by outcome</h3>
   <p class="muted">Share of scored exact answers per outcome. Hallucinated: real exact facts that were not in the context, answered anyway.</p>
   <div class="scroll"><table class="calls" id="outcomes"></table></div>
   <h3>Judge check</h3>
   <div class="row"><button id="jcheck">Check judge</button> <span id="jcinfo" class="muted"></span></div>
+  </div>
   <h3>Calls</h3>
   <div class="scroll"><table class="calls" id="calls"></table></div>
 </section>
@@ -106,13 +110,46 @@ async function loadRuns(select) {
   if ($("runs").value) showRun($("runs").value);
 }
 
+function cell(ok, n) {
+  if (!n) return `<td class="na">·</td>`;
+  const p = Math.round(100 * ok / n), [lo, hi] = wilson(ok, n).map(x => Math.round(100 * x));
+  return `<td style="background: color-mix(in oklab, var(--hi) ${p}%, var(--lo)); color: ${p > 55 ? "#fff" : "inherit"}"
+            title="${ok}/${n} correct, 95% CI ${lo}–${hi}%">${p}%<br><small>${ok}/${n}</small></td>`;
+}
+
+function showIcl(run) {  // HELMET ICL: accuracy per model x length, one panel per dataset
+  const models = run.models.map(m => m.name), lengths = [...new Set(run.results.map(r => r.length))].sort((a, b) => a - b);
+  let html = `<h3>HELMET ICL accuracy</h3><div class="panels">`;
+  for (const ds of (run.datasets ?? []).map(d => d.name)) {
+    html += `<div><div>${esc(ds)}</div><table class="hm"><tr><th>model</th>${lengths.map(l => `<th>${lenLabel(l)}</th>`).join("")}</tr>`;
+    for (const model of models) {
+      html += `<tr><th>${esc(model)}</th>`;
+      for (const l of lengths) {
+        const rs = run.results.filter(r => r.model === model && r.dataset === ds && r.length === l && !r.error);
+        html += cell(rs.filter(r => r.correct).length, rs.length);
+      }
+      html += "</tr>";
+    }
+    html += "</table></div>";
+  }
+  $("heatmaps").innerHTML = html + "</div>";
+  $("calls").innerHTML = `<tr><th>model</th><th>dataset</th><th>length</th><th>item</th><th>shots</th><th>provider</th>
+    <th>tokens sent (local / reported)</th><th>out</th><th>cost</th><th>result</th></tr>` + run.results.map(r => `<tr>
+    <td>${esc(r.model)}</td><td>${esc(r.dataset)}</td><td>${lenLabel(r.length)}</td><td>${esc(r.item)}</td><td>${esc(r.shots)}</td>
+    <td>${esc(r.provider ?? "")}</td><td>${esc(r.context_tokens)} / ${esc(r.prompt_tokens ?? "")}</td>
+    <td>${esc(r.completion_tokens ?? "")}</td><td>${r.cost != null ? "$" + r.cost.toFixed(4) : ""}</td>
+    <td>${r.error ? `<span class="err">${esc(r.error)}</span>` : `${r.correct ? "correct" : "wrong"}: ${esc(r.pred ?? "null")} (gold ${esc(r.gold)})`}</td></tr>`).join("");
+}
+
 async function showRun(id) {
   const run = await api(`/api/runs/${encodeURIComponent(id)}`);
+  $("filingonly").hidden = run.mode === "icl";
   const cost = run.total_cost != null ? ` · $${run.total_cost.toFixed(4)}` : "";
-  $("runinfo").innerHTML = `${esc(run.status)}${cost} · judge ${esc(run.judge)}` +
+  $("runinfo").innerHTML = `${esc(run.status)}${cost}` + (run.judge ? ` · judge ${esc(run.judge)}` : "") +
     (run.error ? ` <span class="err">${esc(run.error)}</span>` : "") +
     (run.mlflow_run_id ? ` · MLflow ${esc(run.mlflow_run_id.slice(0, 8))}` : "") +
     (run.mlflow_error ? ` <span class="err">MLflow: ${esc(run.mlflow_error)}</span>` : "");
+  if (run.mode === "icl") return showIcl(run);
   const models = run.models.map(m => m.name);
   const lengths = [...new Set(run.results.map(r => r.length))]
     .sort((a, b) => (a === "full" ? Infinity : a) - (b === "full" ? Infinity : b));
@@ -174,11 +211,13 @@ async function showRun(id) {
 
 async function start(preset) {
   try {
-    if (preset === "full") {
+    if (preset === "full" || preset === "icl") {
       $("msg").textContent = "Estimating cost…";
-      const e = await api("/api/estimate/full");
+      const e = await api(`/api/estimate/${preset}`);
       const unpriced = e.unpriced_models.length ? ` (no price for ${e.unpriced_models.join(", ")})` : "";
-      if (!confirm(`Full grid: ${e.calls} extraction calls, about $${e.usd.toFixed(2)}${unpriced}. Start?`)) { $("msg").textContent = ""; return; }
+      const toks = Object.entries(e.input_tokens).map(([m, t]) => `${m}: ${(t / 1e6).toFixed(2)}M`).join("; ");
+      if (!confirm(`${preset === "icl" ? "ICL grid" : "Full grid"}: ${e.calls} extraction calls, about $${e.usd.toFixed(2)}${unpriced}.
+Input tokens: ${toks}. Start?`)) { $("msg").textContent = ""; return; }
     }
     const {id} = await api(`/api/runs/${preset}`, {method: "POST"});
     $("msg").textContent = `Started ${id}`;
@@ -193,6 +232,8 @@ async function start(preset) {
 
 $("smoke").onclick = () => start("smoke");
 $("full").onclick = () => start("full");
+$("icl-smoke").onclick = () => start("icl-smoke");
+$("icl").onclick = () => start("icl");
 $("runs").onchange = () => showRun($("runs").value);
 $("jcheck").onclick = async () => {
   const id = $("runs").value;

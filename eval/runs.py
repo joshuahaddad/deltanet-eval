@@ -7,6 +7,7 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+import icl
 from context import RESERVE, build_context, n_tokens
 from edgar import get_filing
 from llm import CONFIG, catalogue, context_limit, extract, judge
@@ -20,18 +21,31 @@ PRESETS = {
     "full": {"filings": [["AAPL", 2024], ["MSFT", 2024], ["GE", 2024], ["KO", 2024], ["F", 2024], ["PFE", 2024],
                          ["BAC", 2024]],
              "lengths": [8192, 16384, 32768, 65536, 131072, "full"], "fields": None},
+    # HELMET many-shot ICL: one call per test item; model_lengths limits a model (by name or provider) to some lengths
+    "icl-smoke": {"mode": "icl", "datasets": ["banking77"], "lengths": [32768], "items": 5},
+    "icl": {"mode": "icl", "datasets": ["banking77", "clinc150"], "lengths": [32768, 65536, 131072], "items": 50,
+            "model_lengths": {"claude-code": [32768]}},  # Claude runs on subscription quota
 }
 
 
+def model_lengths(p: dict, cfg: dict) -> list:
+    allowed = p.get("model_lengths", {})
+    return allowed.get(cfg["name"], allowed.get(cfg.get("provider"), p["lengths"]))
+
+
 def plan(preset: str) -> list[tuple[dict, int | None, dict]]:
-    """Every (filing, budget, model) call in a preset. Skips lengths past the filing or the model's window."""
+    """Every (filing, budget, model) call in a preset, or (dataset, length, model, test item) for ICL.
+    Skips lengths past the filing or the model's window."""
     p = PRESETS[preset]
+    if p.get("mode") == "icl":
+        return [(name, length, cfg, item) for name in p["datasets"] for item in icl.test_items(name, p["items"])
+                for cfg in CONFIG["models"] for length in model_lengths(p, cfg) if length <= context_limit(cfg)]
     tasks = []
     for ticker, fy in p["filings"]:
         filing = get_filing(ticker, fy)
         full = n_tokens(filing["text"]) + RESERVE + 500
         for cfg in CONFIG["models"]:
-            for length in p["lengths"]:
+            for length in model_lengths(p, cfg):
                 if length == "full":
                     if full <= context_limit(cfg):
                         tasks.append((filing, None, cfg))
@@ -40,19 +54,35 @@ def plan(preset: str) -> list[tuple[dict, int | None, dict]]:
     return tasks
 
 
+ICL_OVERHEAD = 300  # instruction, schema and Instructor's wrapper, beyond the demos and the question
+
+
 def estimate(preset: str) -> dict:
-    p, cost, unknown = PRESETS[preset], 0.0, set()
-    for filing, budget, cfg in plan(preset):
-        ctx, qs = build_context(filing, budget, p["fields"])
-        jp = catalogue(CONFIG["judge"]).get("pricing")
-        if jp:
-            cost += sum(n_tokens(q["truth"]) + 500 for q in qs if q["kind"] == "tolerant") * float(jp["prompt"])
+    p, cost, unknown, tokens, prompts = PRESETS[preset], 0.0, set(), {}, {}
+    tasks = plan(preset)
+    for task in tasks:
+        cfg = task[2]
+        if p.get("mode") == "icl":
+            name, length, _, item = task
+            key = (name, length, item["id"])  # the prompt is the same for every model
+            if key not in prompts:
+                pr = icl.build_prompt(name, item, length)
+                prompts[key] = n_tokens(pr["context"] + pr["question"]) + ICL_OVERHEAD
+            sent, out = prompts[key], 30
+        else:
+            ctx, qs = build_context(task[0], task[1], p["fields"])
+            jp = catalogue(CONFIG["judge"]).get("pricing")
+            if jp:
+                cost += sum(n_tokens(q["truth"]) + 500 for q in qs if q["kind"] == "tolerant") * float(jp["prompt"])
+            sent, out = n_tokens(ctx) + 1500, 1500
+        tokens[cfg["name"]] = tokens.get(cfg["name"], 0) + sent
         price = catalogue(cfg).get("pricing")
         if not price:
             unknown.add(cfg["name"] + (" (Claude Code)" if cfg.get("provider") == "claude-code" else ""))
             continue
-        cost += (n_tokens(ctx) + 1500) * float(price["prompt"]) + 1500 * float(price["completion"])
-    return {"preset": preset, "calls": len(plan(preset)), "usd": round(cost, 4), "unpriced_models": sorted(unknown)}
+        cost += sent * float(price["prompt"]) + out * float(price["completion"])
+    return {"preset": preset, "calls": len(tasks), "usd": round(cost, 4), "unpriced_models": sorted(unknown),
+            "input_tokens": tokens}
 
 
 def score_task(filing: dict, budget: int | None, cfg: dict, fields: list[str] | None) -> dict:
@@ -82,6 +112,19 @@ def score_task(filing: dict, budget: int | None, cfg: dict, fields: list[str] | 
     return res | {"judge_cost": judge_cost}
 
 
+def score_icl(name: str, length: int, cfg: dict, item: dict) -> dict:
+    """One ICL test item: the demos and the question through the extraction path, scored by exact label match."""
+    pr = icl.build_prompt(name, item, length)
+    res = {"model": cfg["name"], "model_id": cfg["model"], "dataset": name, "length": length, "item": item["id"],
+           "text": item["text"], "gold": pr["gold"], "shots": pr["shots"],
+           "context_tokens": n_tokens(pr["context"] + pr["question"]), "pred": None, "correct": None}
+    try:
+        answers, meta = extract(cfg, pr["context"], icl.SCHEMA, system=icl.SYSTEM, ask=pr["question"])
+    except Exception as e:  # as with filings, a failed call is shown and left out of accuracy
+        return res | {"error": f"{type(e).__name__}: {e}"}
+    return res | meta | {"pred": answers.get("label"), "correct": answers.get("label") == pr["gold"]}
+
+
 def save_run(run: dict):
     RUNS.mkdir(exist_ok=True)
     (RUNS / f"{run['id']}.json").write_text(json.dumps(run, indent=1))
@@ -92,19 +135,28 @@ def start_run(preset: str) -> str:
         if "api_key_env" in cfg and not os.environ.get(cfg["api_key_env"]):
             raise RuntimeError(f"Set {cfg['api_key_env']} first")
     rid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{preset}"
+    p = PRESETS[preset]
+    is_icl = p.get("mode") == "icl"
     run = {"id": rid, "preset": preset, "status": "running", "started": dt.datetime.now().isoformat(timespec="seconds"),
-           "judge": CONFIG["judge"]["model"], "models": [{k: m.get(k) for k in ("name", "model", "base_url", "provider")}
+           "judge": None if is_icl else CONFIG["judge"]["model"], "models": [{k: m.get(k) for k in ("name", "model", "base_url", "provider")}
                                                          for m in CONFIG["models"]], "results": []}
     lock = threading.Lock()
 
     def work():
         try:
             tasks = plan(preset)
-            run["filings"] = list({f["url"]: {k: f[k] for k in ("ticker", "fy", "accn", "url", "period_end")}
-                                   | {"full_tokens": n_tokens(f["text"])} for f, _, _ in tasks}.values())
+            if is_icl:
+                run["mode"] = "icl"
+                run["datasets"] = [{"name": n, "hf": icl.DATASETS[n][0], "revision": icl.DATASETS[n][1],
+                                    "items": p["items"], "helmet_shots": {str(k): v for k, v in icl.DATASETS[n][6].items()}}
+                                   for n in p["datasets"]]
+            else:
+                run["filings"] = list({f["url"]: {k: f[k] for k in ("ticker", "fy", "accn", "url", "period_end")}
+                                       | {"full_tokens": n_tokens(f["text"])} for f, _, _ in tasks}.values())
             save_run(run)
+            score = (lambda t: score_icl(*t)) if is_icl else (lambda t: score_task(*t, p["fields"]))
             with ThreadPoolExecutor(4) as pool:
-                for r in pool.map(lambda t: score_task(*t, PRESETS[preset]["fields"]), tasks):
+                for r in pool.map(score, tasks):
                     with lock:
                         run["results"].append(r)
                         save_run(run)
@@ -134,6 +186,31 @@ def answer_rows(results: list[dict]) -> list[dict]:
             | {k: q.get(k) for k in ANSWER_COLUMNS if k in q} for r in results for q in r["fields"]]
 
 
+ICL_COLUMNS = ["dataset", "length", "item", "text", "gold", "pred", "correct", "shots", "call_error"]
+
+
+def icl_rows(results: list[dict]) -> list[dict]:
+    return [{k: r.get(k) for k in ICL_COLUMNS} | {"call_error": r.get("error")} for r in results]
+
+
+def length_label(length) -> str:
+    return length if length == "full" else f"{length // 1024}k"
+
+
+def icl_metrics(results: list[dict]) -> dict:
+    """Accuracy per dataset x length with its Wilson 95% interval and count; failed calls are left out."""
+    cells = {}
+    for r in results:
+        if not r.get("error"):
+            ok, n = cells.get((r["dataset"], r["length"]), (0, 0))
+            cells[(r["dataset"], r["length"])] = (ok + bool(r["correct"]), n + 1)
+    m = {}
+    for (ds, length), (ok, n) in cells.items():
+        k, (lo, hi) = f"{ds}/{length_label(length)}", wilson(ok, n)
+        m |= {f"icl_acc/{k}": ok / n, f"icl_acc_lo/{k}": lo, f"icl_acc_hi/{k}": hi, f"icl_n/{k}": n}
+    return m
+
+
 def accuracy_metrics(results: list[dict]) -> dict:
     """The heatmap cells, collapsed: accuracy, its Wilson 95% interval and count per kind x source, overall and per
     length; exact outcome rates per source; and the hallucination rate on real exact facts absent from the context."""
@@ -141,7 +218,7 @@ def accuracy_metrics(results: list[dict]) -> dict:
     for r in results:
         if r.get("error"):
             continue
-        length = r["length"] if r["length"] == "full" else f"{r['length'] // 1024}k"
+        length = length_label(r["length"])
         for q in r["fields"]:
             if q["kind"] == "exact" and q["source"] == "real" and q["depth"] is None and "outcome" in q:
                 absent[0] += q["outcome"] != "abstained"  # answered although the fact was not sent
@@ -182,8 +259,11 @@ def log_mlflow(run: dict) -> str:
     if uri.startswith("sqlite:") and mlflow.get_experiment_by_name(name) is None:
         mlflow.create_experiment(name, artifact_location=(HERE / "mlruns").as_uri())  # not relative to the cwd
     mlflow.set_experiment(name)
+    is_icl = run.get("mode") == "icl"
     with mlflow.start_run(run_name=run["id"]) as parent:
-        mlflow.log_params({"preset": run["preset"], "judge": run["judge"], "status": run["status"],
+        mlflow.log_params({"preset": run["preset"], "mode": "icl", "status": run["status"],
+                           "datasets": ", ".join(d["name"] for d in run.get("datasets", []))} if is_icl else
+                          {"preset": run["preset"], "judge": run["judge"], "status": run["status"],
                            "filings": ", ".join(f"{f['ticker']} FY{f['fy']}" for f in run.get("filings", []))})
         mlflow.log_metric("total_cost_usd", run["total_cost"])
         mlflow.log_dict(run, "run.json")
@@ -192,15 +272,15 @@ def log_mlflow(run: dict) -> str:
             with mlflow.start_run(run_name=m["name"], nested=True):
                 mlflow.log_params({"model": m["model"], "endpoint": m.get("provider") or m.get("base_url")})
                 calls = [{k: v for k, v in r.items() if k != "fields"} for r in results]
-                mlflow.log_metrics(accuracy_metrics(results) | {
+                mlflow.log_metrics((icl_metrics(results) if is_icl else accuracy_metrics(results)) | {
                     "calls": len(results), "calls_failed": sum(1 for r in results if r.get("error")),
                     "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in results),
                     "cost_usd": sum((r.get("cost") or 0) for r in results),
                     "notional_cost_usd": sum((r.get("notional_cost") or r.get("cost") or 0) for r in results)})
                 out = io.StringIO()
-                w = csv.DictWriter(out, ANSWER_COLUMNS)
+                w = csv.DictWriter(out, ICL_COLUMNS if is_icl else ANSWER_COLUMNS)
                 w.writeheader()
-                w.writerows(answer_rows(results))
+                w.writerows(icl_rows(results) if is_icl else answer_rows(results))
                 mlflow.log_text(out.getvalue(), "answers.csv")
                 mlflow.log_dict(calls, "calls.json")
     return parent.info.run_id
@@ -241,6 +321,8 @@ def judge_check(run: dict) -> dict:
 
 def start_judge_check(rid: str):
     run = json.loads((RUNS / f"{rid}.json").read_text())
+    if run.get("mode") == "icl":
+        raise RuntimeError("ICL runs have no judged answers")
     if run["status"] == "running" or (run.get("judge_check") or {}).get("status") == "running":
         raise RuntimeError("wait for the run or the current judge check to finish")
     if "judge_check" not in CONFIG:

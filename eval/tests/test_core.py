@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import context  # noqa: E402
 import edgar  # noqa: E402
+import icl  # noqa: E402
 import llm  # noqa: E402
 import runs  # noqa: E402
 import scoring  # noqa: E402
@@ -245,3 +246,90 @@ def test_log_mlflow(tmp_path, monkeypatch):
     assert child.data.metrics["acc/exact_planted"] == 0.5 and child.data.metrics["calls_failed"] == 1
     assert {a.path for a in c.list_artifacts(child.info.run_id)} == {"answers.csv", "calls.json"}
     assert "run.json" in {a.path for a in c.list_artifacts(rid)}
+
+
+FAKE_DS = ("fake/ds", "rev", "train.parquet", "test.parquet", "label", 10, {8192: 400, 32768: 1000})
+
+
+def _fake_icl(monkeypatch):
+    """Ten labels, long training texts so 400 shots overflow 8k; separate test texts. No network."""
+    train = [{"id": i, "text": f"train {i} " + "please help me with my card " * 2, "label": i % 10} for i in range(300)]
+    test = [{"id": i, "text": f"test question {i}", "label": (i * 7) % 10} for i in range(60)]
+    monkeypatch.setitem(icl.DATASETS, "fake", FAKE_DS)
+    monkeypatch.setitem(icl._data, "fake", (train, test))
+    return train, test
+
+
+def test_icl_balance_labels():
+    data = [{"id": i, "text": str(i), "label": i % 5} for i in range(50)]
+    out = icl.balance_labels(data, 15, seed=3)
+    for r in range(3):  # each round of five holds every label once
+        assert sorted(x["label"] for x in out[5 * r:5 * r + 5]) == list(range(5))
+    assert out == icl.balance_labels(data, 15, seed=3) and out != icl.balance_labels(data, 15, seed=4)
+
+
+def test_icl_prompt(monkeypatch):
+    train, _ = _fake_icl(monkeypatch)
+    items = icl.test_items("fake", 10)
+    assert items == icl.test_items("fake", 10) and len({i["label"] for i in items}) == 10  # balanced, seeded
+    for length in (8192, 32768):
+        for item in items[:3]:
+            p = icl.build_prompt("fake", item, length)
+            assert p == icl.build_prompt("fake", item, length)  # deterministic
+            budget = length - context.RESERVE - context.n_tokens(icl.SYSTEM + item["text"])
+            assert context.n_tokens(p["context"]) <= budget
+            assert p["shots"] == len(p["demo_ids"]) <= p["helmet_shots"] == FAKE_DS[6][length]
+            blocks = p["context"].split("\n\n")
+            assert len(blocks) == p["shots"]
+            assert item["text"] not in {b.split("\nlabel: ")[0] for b in blocks}  # the test item is not a demo
+            mapping = icl.label_map(10, icl.item_seed(item["text"]))
+            assert sorted(mapping) == list(range(10)) and p["gold"] == mapping[item["label"]]
+            shown = {}
+            for i, b in zip(p["demo_ids"], blocks):  # one original label -> one integer, and back
+                assert b.endswith(f"\nlabel: {mapping[train[i]['label']]}")
+                shown.setdefault(train[i]["label"], set()).add(int(b.rsplit(" ", 1)[1]))
+            assert all(len(v) == 1 for v in shown.values()) and len(set().union(*shown.values())) == len(shown)
+    assert icl.build_prompt("fake", items[0], 8192)["shots"] < 400  # 8k is too small for every shot here
+    assert icl.build_prompt("fake", items[0], 32768)["shots"] == 1000  # repeats labels' examples, as HELMET does
+
+
+def test_icl_plan_model_lengths(monkeypatch):
+    monkeypatch.setattr(icl, "test_items", lambda name, n: [{"id": i, "text": f"{name} {i}", "label": 0} for i in range(n)])
+    tasks = runs.plan("icl")
+    claude = [t for t in tasks if t[2].get("provider") == "claude-code"]
+    assert len(tasks) == 2 * 50 * (2 * 3 + 1) and {t[1] for t in claude} == {32768}
+    assert len(runs.plan("icl-smoke")) == 5 * len(llm.CONFIG["models"])
+
+
+def _fake_icl_run():
+    r = lambda model, ds, length, item, correct, **kw: {
+        "model": model, "dataset": ds, "length": length, "item": item, "text": "t", "gold": 3,
+        "pred": 3 if correct else 5, "correct": correct, "shots": 10} | kw
+    return {"id": "icl-test", "preset": "icl-smoke", "mode": "icl", "judge": None, "status": "done", "total_cost": 0.0,
+            "datasets": [{"name": "banking77"}], "models": [{"name": "M", "model": "m/x", "base_url": "u"}],
+            "results": [r("M", "banking77", 32768, 1, True), r("M", "banking77", 32768, 2, False),
+                        r("M", "banking77", 32768, 3, True), r("M", "banking77", 65536, 1, False),
+                        r("M", "banking77", 65536, 2, None, error="boom", pred=None)]}
+
+
+def test_icl_metrics():
+    m = runs.icl_metrics(_fake_icl_run()["results"])
+    lo, hi = scoring.wilson(2, 3)
+    assert m == {"icl_acc/banking77/32k": 2 / 3, "icl_acc_lo/banking77/32k": lo, "icl_acc_hi/banking77/32k": hi,
+                 "icl_n/banking77/32k": 3, "icl_acc/banking77/64k": 0.0, "icl_acc_lo/banking77/64k": 0.0,
+                 "icl_acc_hi/banking77/64k": scoring.wilson(0, 1)[1], "icl_n/banking77/64k": 1}
+    rows = runs.icl_rows(_fake_icl_run()["results"])
+    assert rows[0] == {"dataset": "banking77", "length": 32768, "item": 1, "text": "t", "gold": 3, "pred": 3,
+                       "correct": True, "shots": 10, "call_error": None} and rows[-1]["call_error"] == "boom"
+
+
+def test_log_mlflow_icl(tmp_path, monkeypatch):
+    from mlflow.tracking import MlflowClient
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'm.db'}")
+    rid = runs.log_mlflow(_fake_icl_run())
+    c = MlflowClient()
+    child = c.search_runs([c.get_run(rid).info.experiment_id], f"tags.mlflow.parentRunId = '{rid}'")[0]
+    assert child.data.metrics["icl_acc/banking77/32k"] == pytest.approx(2 / 3) and child.data.metrics["calls_failed"] == 1
+    assert {a.path for a in c.list_artifacts(child.info.run_id)} == {"answers.csv", "calls.json"}
+    assert c.get_run(rid).data.params["mode"] == "icl"
