@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+notes/
+.media/
+.cache/
+animations/media/
+figures/work/
+qa/shots/
+eval/.env
+.env
