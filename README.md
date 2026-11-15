@@ -1,6 +1,6 @@
 # Allow Linear Attention to Forget, and Word Order Comes Free
 
-The companion repo for [*Allow Linear Attention to Forget, and Word Order Comes Free*](POST_URL), part 2 of the DeltaNet series ([part 1](https://joshuahaddad.substack.com/p/drop-softmax-and-attention-becomes-an-rnn)).
+The companion repo for [*Allow Linear Attention to Forget, and Word Order Comes Free*](https://joshuahaddad.substack.com/p/gated-deltanet-kimi-linear-forget-gates), part 2 of the DeltaNet series ([part 1](https://joshuahaddad.substack.com/p/drop-softmax-and-attention-becomes-an-rnn)).
 
 The post adds forget gates to the delta rule: Gated DeltaNet's per-head decay, Kimi Delta Attention's per-channel decay, and Gated DeltaNet-2's separate erase and write gates. It shows why that recurrence also encodes word order, so Kimi Linear can drop RoPE. It then tests a Gated DeltaNet hybrid (Qwen3-Next 80B-A3B) against full-attention Qwen3 30B-A3B and 235B-A22B on 10-K filings.
 
