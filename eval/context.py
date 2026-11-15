@@ -12,72 +12,75 @@ RESERVE = 2048  # tokens kept free for instructions, schema and the answer
 DEPTHS = (0.1, 0.3, 0.5, 0.7, 0.9)
 MIN_PASSAGE_IN_CONTEXT = 0.5  # a real tolerant question counts as present when this share of its passage was sent
 
-PLANTS = [  # (subject, tolerant statement, tolerant question, decoy subject, answer stems); PLANTS_PER_DEPTH per
-    # depth, in order. A correct tolerant answer contains every stem (lowercase substring).
+DESIGN = 2  # bump when the planted set changes: a run's contexts can only be rebuilt by the design that made them
+
+PLANTS = [  # (subject, tolerant statement, tolerant question, far decoy subject, near decoy subject, answer stems);
+    # PLANTS_PER_DEPTH per depth, in order. A correct tolerant answer contains every stem (lowercase substring).
     ("the Brookfield archive audit",
      "The records team noted that the Brookfield archive will move to cold storage because staff rarely request files older than ten years.",
      "Why is the Brookfield archive moving to cold storage?",
-     "the Brookfield archive review", ["rarely", "request"]),
+     "the Brookfield archive review", "the Brookfield archive survey", ["rarely", "request"]),
     ("the Ridgeway office pilot",
      "Management said the Ridgeway office pilot ended early because employees preferred the older desk-booking system.",
      "Why did the Ridgeway office pilot end early?",
-     "the Ridgeway office trial", ["prefer", "desk"]),
+     "the Ridgeway office trial", "the Ridgeway office study", ["prefer", "desk"]),
     ("the Lantern Street lease review",
      "The facilities group did not renew the Lantern Street warehouse lease because rising flood insurance costs made it uneconomic.",
      "Why was the Lantern Street warehouse lease not renewed?",
-     "the Lantern Street lease audit", ["flood", "insur"]),
+     "the Lantern Street lease audit", "the Lantern Street lease renewal", ["flood", "insur"]),
     ("the Marlow unit survey",
      "In an internal survey, most staff in the Marlow unit asked for longer onboarding because the new ordering software was confusing.",
      "What did Marlow unit staff ask for, and why?",
-     "the Marlow unit census", ["onboard", "software"]),
+     "the Marlow unit census", "the Marlow unit poll", ["onboard", "software"]),
     ("the travel committee review",
      "The travel committee replaced quarterly offsites with one annual meeting to cut travel time for field teams.",
      "What did the travel committee change, and why?",
-     "the travel committee audit", ["annual", "travel"]),
+     "the travel committee audit", "the travel committee survey", ["annual", "travel"]),
     ("the Ashcombe fleet study",
      "The Ashcombe depot switched its delivery vans to a four-day rota after drivers reported fatigue on long weekly routes.",
      "Why did the Ashcombe depot change its delivery rota?",
-     "the Ashcombe fleet review", ["driver", "fatigu|tired|exhaust"]),
+     "the Ashcombe fleet review", "the Ashcombe fleet audit", ["driver", "fatigu|tired|exhaust"]),
     ("the Pellham badge upgrade",
      "Security staff at the Pellham site replaced paper visitor logs with badges because the logs were often illegible.",
      "Why were the paper visitor logs at Pellham replaced?",
-     "the Pellham badge rollout", ["log", "legib|hard to read|unread"]),
+     "the Pellham badge rollout", "the Pellham badge review", ["log", "legib|hard to read|unread"]),
     ("the Corran Bay recycling trial",
      "The Corran Bay plant stopped its cardboard recycling trial because the local collector raised its fees twice in one year.",
      "Why did the Corran Bay recycling trial stop?",
-     "the Corran Bay recycling study", ["collect", "fee|price|cost|charg"]),
+     "the Corran Bay recycling study", "the Corran Bay recycling pilot", ["collect", "fee|price|cost|charg"]),
     ("the Whitlow mentoring scheme",
      "Engineers in the Whitlow group started pairing new hires with senior staff because early attrition had doubled.",
      "Why did the Whitlow group start pairing new hires with senior staff?",
-     "the Whitlow mentoring review", ["attrition", "doubl"]),
+     "the Whitlow mentoring review", "the Whitlow mentoring pilot", ["attrition", "doubl"]),
     ("the Ostend kiosk rollout",
      "The Ostend stores delayed their self-service kiosks because older customers found the touch screens hard to read.",
      "Why were the Ostend self-service kiosks delayed?",
-     "the Ostend kiosk trial", ["older", "screen"]),
+     "the Ostend kiosk trial", "the Ostend kiosk upgrade", ["older", "screen"]),
     ("the Harrowgate cafeteria review",
      "The Harrowgate cafeteria moved to local suppliers after a long delivery delay left it without fresh produce for a week.",
      "Why did the Harrowgate cafeteria move to local suppliers?",
-     "the Harrowgate cafeteria audit", ["deliver", "delay"]),
+     "the Harrowgate cafeteria audit", "the Harrowgate cafeteria survey", ["deliver", "delay"]),
     ("the Fenwick help desk change",
      "The Fenwick help desk extended its hours into the evening because most overseas tickets arrived after the office closed.",
      "Why did the Fenwick help desk extend its hours?",
-     "the Fenwick help desk review", ["overseas", "ticket"]),
+     "the Fenwick help desk review", "the Fenwick help desk audit", ["overseas", "ticket"]),
     ("the Kestrel parking review",
      "The Kestrel campus turned half its parking lot into bike storage after a commuter survey showed most staff cycled in summer.",
      "Why did the Kestrel campus convert parking into bike storage?",
-     "the Kestrel parking survey", ["survey", "cycl"]),
+     "the Kestrel parking survey", "the Kestrel parking audit", ["survey", "cycl"]),
     ("the Dunmore printing policy",
      "The Dunmore office removed most of its printers because staff printed fewer than ten pages a week on average.",
      "Why did the Dunmore office remove most of its printers?",
-     "the Dunmore printing audit", ["page|print", "week"]),
+     "the Dunmore printing audit", "the Dunmore printing review", ["page|print", "week"]),
     ("the Selby training audit",
      "The Selby plant moved safety training from video to hands-on sessions because quiz scores after the videos were poor.",
      "Why did the Selby plant change how it runs safety training?",
-     "the Selby training review", ["quiz|test|score"]),
+     "the Selby training review", "the Selby training survey", ["quiz|test|score"]),
 ]
 PLANTS_PER_DEPTH = 3
 PLANT_SPREAD = 0.02  # the facts at one depth sit 2% apart, all inside its 20%-wide heatmap bin
-DECOY_OFFSET = 0.01  # decoys sit between the 2%-spaced real plants, so the two never share a line
+DECOY_OFFSET = 0.01  # far decoys sit between the 2%-spaced real plants, so the two never share a line
+NEAR_OFFSET = 0.005  # near decoys sit just after their target, in its bin, and halfway to any far decoy
 DECOY_SENTENCE = "The entry was filed for the record and needs no follow-up."
 
 
@@ -86,24 +89,33 @@ def code(rng: random.Random) -> str:
 
 
 def planted_facts(seed: str) -> list[dict]:
-    rng, decoy_rng = random.Random(seed), random.Random(seed + "-decoy")  # own stream keeps the real codes as before
+    # own streams keep the real and far decoy codes as before
+    rng, decoy_rng, near_rng = random.Random(seed), random.Random(seed + "-decoy"), random.Random(seed + "-near")
     out = []
-    for n, (subject, statement, question, decoy_subject, stems) in enumerate(PLANTS):
+    for n, (subject, statement, question, decoy_subject, near_subject, stems) in enumerate(PLANTS):
         i, j = n // PLANTS_PER_DEPTH, n % PLANTS_PER_DEPTH
         offset = (j - (PLANTS_PER_DEPTH - 1) / 2) * PLANT_SPREAD
         target = round(DEPTHS[i] + offset, 4)
-        # the decoy sits 40 points deeper, wrapped into the 10..90 bins: a lookalike in a different part of the text
-        decoy_target = round(DEPTHS[(i + 2) % len(DEPTHS)] + offset + DECOY_OFFSET, 4)
-        truth, decoy = code(rng), code(decoy_rng)
+        # the far decoy sits 40 points deeper, wrapped into the 10..90 bins; the near one in the same bin, just after
+        targets = {"near": round(target + NEAR_OFFSET, 4),
+                   "far": round(DEPTHS[(i + 2) % len(DEPTHS)] + offset + DECOY_OFFSET, 4)}
+        truth, decoys = code(rng), {"near": code(near_rng), "far": code(decoy_rng)}
         tag = f"{round(DEPTHS[i] * 100)}{'abc'[j]}"
         out.append({"field": f"planted_code_{tag}", "kind": "exact", "source": "planted", "type": "code",
                     "target": target, "question": f"What is the internal reference code for {subject}?",
                     "truth": truth, "paragraph": f"Internal reference code for {subject}: {truth}. {statement}",
-                    "decoy": decoy, "decoy_target": decoy_target,
-                    "decoy_paragraph": f"Internal reference code for {decoy_subject}: {decoy}. {DECOY_SENTENCE}"})
+                    "decoys": decoys, "decoy_targets": targets, "decoy_paragraphs": {
+                        k: f"Internal reference code for {s}: {decoys[k]}. {DECOY_SENTENCE}"
+                        for k, s in (("near", near_subject), ("far", decoy_subject))}})
         out.append({"field": f"planted_note_{tag}", "kind": "tolerant", "source": "planted", "type": "text",
                     "target": target, "question": question, "truth": statement, "stems": stems})
     return out
+
+
+def planted_paragraphs(plants: list[dict]) -> list[tuple[float, str]]:
+    """Every paragraph planted: (target depth, text), the real ones and both decoys."""
+    return [(p["target"], p["paragraph"]) for p in plants if "paragraph" in p] + \
+        [(p["decoy_targets"][k], t) for p in plants for k, t in p.get("decoy_paragraphs", {}).items()]
 
 
 def plant(text: str, inserts: list[tuple[float, str]]) -> tuple[str, list[int]]:
@@ -139,12 +151,11 @@ def truncate(text: str, max_tokens: int) -> str:
 def build_context(filing: dict, budget: int | None, fields: list[str] | None = None) -> tuple[str, list[dict]]:
     """Truncate, plant, and locate every question in the context that is sent. budget None means the full filing."""
     plants = planted_facts(f"{filing['ticker']}-{filing['fy']}")
-    inserts = [(p["target"], p["paragraph"]) for p in plants if "paragraph" in p] + \
-              [(p["decoy_target"], p["decoy_paragraph"]) for p in plants if "decoy_paragraph" in p]
-    plant_tokens = sum(n_tokens(text) + 2 for _, text in inserts)
+    ins = planted_paragraphs(plants)
+    plant_tokens = sum(n_tokens(text) + 2 for _, text in ins)
     body = filing["text"] if budget is None else truncate(filing["text"], budget - RESERVE - plant_tokens)
-    ctx, positions = plant(body, inserts)
-    pos_of = dict(zip(sorted(t for t, _ in inserts), positions))
+    ctx, positions = plant(body, ins)
+    pos_of = dict(zip(sorted(t for t, _ in ins), positions))
     qs = []
     for field, t in filing["truths"].items():
         kind = "tolerant" if t["type"] == "text" else "exact"
@@ -160,9 +171,10 @@ def build_context(filing: dict, budget: int | None, fields: list[str] | None = N
         qs.append({"field": field, "kind": kind, "source": "real", "type": t["type"], "question": t["question"],
                    "truth": truth, "depth": None if pos is None or pos < 0 else pos / len(ctx)})
     for p in plants:
-        qs.append({k: v for k, v in p.items() if k not in ("paragraph", "decoy_paragraph")}
+        qs.append({k: v for k, v in p.items() if k not in ("paragraph", "decoy_paragraphs")}
                   | {"depth": pos_of[p["target"]] / len(ctx)}
-                  | ({"decoy_depth": pos_of[p["decoy_target"]] / len(ctx)} if "decoy" in p else {}))
+                  | ({"decoy_depths": {k: pos_of[t] / len(ctx) for k, t in p["decoy_targets"].items()}}
+                     if "decoys" in p else {}))
     if fields:
         qs = [q for q in qs if q["field"] in fields]
     return ctx, qs

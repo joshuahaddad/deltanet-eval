@@ -20,7 +20,7 @@ Needs [uv](https://docs.astral.sh/uv/). From this folder:
 ```bash
 export HF_TOKEN=hf_...                # the Qwen models via Hugging Face (Claude runs through your local `claude` login)
 export EDGAR_CONTACT=you@example.com # SEC requires a contact in the User-Agent
-uv run app.py                        # http://127.0.0.1:8765 (set PORT to change)
+uv run app.py                        # http://127.0.0.1:8780 (set PORT to change)
 uv run pytest
 ```
 
@@ -31,7 +31,7 @@ uv run pytest
 | `LITELLM_API_KEY` | optional: a LiteLLM gateway entry (see Models) |
 | `ANTHROPIC_API_KEY` | optional: when set, `claude -p` bills it instead of your Claude subscription |
 | `EDGAR_CONTACT` | the `User-Agent: filing-recall <contact>` header that EDGAR requires |
-| `PORT` | optional, default 8765 |
+| `PORT` | optional, default 8780 (8765 is AnkiConnect's port) |
 | `MLFLOW_TRACKING_URI` | optional: your MLflow server, e.g. `http://host:5000`. Unset logs to the local `eval/mlflow.db`. |
 | `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD` | optional: for a server with auth turned on (MLflow reads them itself) |
 | `MLFLOW_EXPERIMENT_NAME` | optional, default `filing-recall` |
@@ -40,9 +40,19 @@ Keys are read from the environment only and are never written to runs or logs.
 
 On the page:
 
-- **Run smoke**: one filing (Apple FY2024), 8k tokens, every model, four fields (fiscal year end, revenue, one planted code, one planted note), in every call mode. That is 4 calls per model, 12 in all, and under a cent.
-- **Run full grid…**: seven FY2024 filings, 45k to 208k tokens long (AAPL, MSFT, GE, KO, F, PFE and BAC), at 8k, 32k and 128k tokens, every field, in every call mode (see [Call modes](#what-is-measured)). Only F, PFE and BAC are long enough for 128k; KO, at 126k tokens, is not. Claude runs at 32k only, because it uses subscription quota. That is 1,292 calls: 534 per Qwen model and 224 for Claude.
-- The page shows a cost estimate before a grid starts, from the prices OpenRouter or the Hugging Face router (`https://router.huggingface.co/v1/models`) list for the pinned provider. Claude Code models, Claude and the judge, are listed as unpriced. For the full grid, each Qwen model gets about 20.15M input tokens: about $1.90 for Qwen3-Next and $1.86 for Qwen3-235B at DeepInfra's rates (both $0.09 per million input tokens; output is $1.10 and $0.55 per million). Claude gets about 6.73M input tokens, on quota. Most of the tokens are the single calls, which each send the whole context for one question.
+- **Run smoke**: one filing (Apple FY2024), 8k tokens, every model, four fields (fiscal year end, revenue, one planted code, one planted note), in every call mode. Single calls ask planted codes only, so that is 3 calls per model, 9 in all, and under a cent.
+- **Run full grid…**: ten FY2024 filings (AAPL, MSFT, GE, KO, F, PFE, BAC, JPM, C and WFC), 21k to 299k tokens long, at 8k, 32k, 128k and 192k tokens, every field, in every call mode (see [Call modes](#what-is-measured)). 192k stays inside Qwen's 262k window, with a margin for Qwen's own tokenizer, which differs from `o200k_base`. Which filings reach which lengths:
+
+  | Length | Filings | Count |
+  |---|---|---|
+  | 8k | all ten | 10 |
+  | 32k | all but WFC | 9 |
+  | 128k | F, PFE, BAC, JPM, C (KO, at 126k tokens, is just short) | 5 |
+  | 192k | BAC, JPM, C | 3 |
+
+  WFC's primary 10-K document is only about 21k tokens, because its annual report is filed as an exhibit, so it contributes at 8k only. Claude runs at 32k only, because it uses subscription quota. Each filing, length and model gets 1 batched call and 15 single calls, and each filing and model gets one closed-book call. That is 1,037 calls: 442 per Qwen model and 153 for Claude.
+- The page shows a cost estimate before a grid starts, from the prices OpenRouter or the Hugging Face router (`https://router.huggingface.co/v1/models`) list for the pinned provider. Claude Code models, Claude and the judge, are listed as unpriced. For the full grid, each Qwen model gets about 25.2M input tokens: about $2.36 for Qwen3-Next and $2.32 for Qwen3-235B, $4.68 together, at DeepInfra's rates (both $0.09 per million input tokens; output is $1.10 and $0.55 per million). By length, the two together cost about $0.24 at 8k, $0.85 at 32k, $1.89 at 128k and $1.70 at 192k. Claude gets about 4.47M input tokens, on quota. Most of the tokens are the single calls, which each send the whole context for one question. The first full run cost about 4% more than its estimate (see [First run](#first-run)). The estimate also returns `usd_per_model` and `missing_filings`: a filing that can't be loaded is listed there and left out of the count instead of failing the estimate.
+- **Retry failed calls**: on a finished filing run, the page's retry button (or `POST /api/runs/{rid}/retry`) re-runs only the calls that errored and replaces their results in place. It then recomputes the paired stats and the total cost and logs a new MLflow run; the old one stays, named in the run file's `retry.previous_mlflow_run_id`. The `retry` key also records the status, the number of calls retried and how many still failed. Contexts are rebuilt from the code, so a retry is refused when the run's `design` differs from the code's. Runs from before `design` existed have none and can't be retried. Only one job (the run, a retry or a judge check) may write a run file at a time.
 - **Run ICL smoke** and **Run ICL grid…**: HELMET's many-shot ICL task; see [HELMET ICL mode](#helmet-icl-mode). The grid shows its call count and input tokens per model before it starts.
 - **Use mode**: fetch a 10-K by ticker and fiscal year, or upload an `.htm`, `.html` or `.txt` file, and give a JSON schema (objects, arrays, strings, numbers, booleans). It uses the same extraction code as the eval, with no scoring.
 
@@ -62,7 +72,7 @@ A LiteLLM gateway, for local models, is an OpenAI-compatible entry. The `model` 
  "model": "local-coder", "context_length": 131072}
 ```
 
-Each call records the serving provider (as the endpoint reports it, or `claude-code/firstParty`), the tokens sent (counted locally and as reported), the completion tokens, the cost and the wall-clock latency (`latency_s`). Reported prompt tokens include each model's own tokenizer and harness overhead. For example, an 8k cell of about 6.1k `o200k` tokens comes to about 11.3k tokens through Claude Code.
+Each call records the serving provider (as the endpoint reports it, or `claude-code/firstParty`), the tokens sent (counted locally and as reported), the completion tokens, the cost, the wall-clock latency (`latency_s`) and, for OpenAI-compatible endpoints, the number of `attempts`. A 429, 500, 502, 503 or 504, or a timeout, gets up to 3 more attempts, after waits of 10, 30 and 60 seconds, each stretched by up to 20% of random jitter. Other errors fail at once. `latency_s` is the answering attempt only, without the waits. Instructor's own retries, up to 2, cover answers that fail validation, not transport errors. Reported prompt tokens include each model's own tokenizer and harness overhead. For example, an 8k cell of about 6.1k `o200k` tokens comes to about 11.3k tokens through Claude Code.
 
 ## MLflow
 
@@ -74,7 +84,7 @@ uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 
 To use your server instead, set `MLFLOW_TRACKING_URI`, plus the username and password if it uses auth.
 
-- **The parent run** is named after the run ID. It holds the run's parameters (preset, judge, filings, status), `total_cost_usd` and the whole run file as `run.json`. It also holds the paired headline (see [Reading the results](#reading-the-results)) as `paired/<A vs B>/<stat>/<length>`, with bounds `paired_lo/...` and `paired_hi/...`. `<stat>` is `exact_gap`, `tolerant_gap` or `did`, and `<length>` is `8k`, `32k`, `128k` or `all`. The pair name drops characters MLflow doesn't allow, so "Qwen3 235B-A22B (full attention)" becomes "Qwen3 235B-A22B full attention".
+- **The parent run** is named after the run ID. It holds the run's parameters (preset, judge, filings, status), `total_cost_usd` and the whole run file as `run.json`. It also holds the paired headline (see [Reading the results](#reading-the-results)) as `paired/<A vs B>/<mode>/<stat>/<length>`, with bounds `paired_lo/...` and `paired_hi/...`. `<mode>` is `batched` or `single`, `<stat>` is `exact_gap`, `tolerant_gap` or `did` (the last two in batched only), and `<length>` is `8k`, `32k`, `128k`, `192k` or `all`. Paired entries from run files before call modes have no mode and are logged as `single`, which is what they were. The pair name drops characters MLflow doesn't allow, so "Qwen3 235B-A22B (full attention)" becomes "Qwen3 235B-A22B full attention".
 - **One child run per model** holds the cells as metrics, keyed by call mode (`batched`, `single` or `closed_book`):
   - `acc/<mode>/<kind>_<source>` overall, `acc/<mode>/<kind>_<source>/<length>` and `acc/<mode>/<kind>_<source>/d<10|30|50|70|90>` per depth bin, pooled over lengths, with matching `n/...` counts and Wilson 95% bounds `acc_lo/...` and `acc_hi/...`. Closed-book calls have no length or depth, so they log only `acc/closed_book/exact_real`.
   - `acc/batched/exact_real_unmemorised`: batched real exact accuracy without the facts the model got right closed-book. Logged only when the run has closed-book calls.
@@ -83,7 +93,7 @@ To use your server instead, set `MLFLOW_TRACKING_URI`, plus the username and pas
   - Per mode: `calls_failed/<mode>`, `notional_cost_usd/<mode>`, `cost_per_correct/<mode>` and `latency_s_median/<mode>`. Totals across modes: `calls`, `calls_failed`, `prompt_tokens`, `cost_usd` and `notional_cost_usd`.
   - Batched cells also keep their old names, without the mode: `acc/<kind>_<source>`, `acc/<kind>_<source>/<length>` (with their `n`, `acc_lo` and `acc_hi`) and `outcome/exact_<source>/<outcome>`. Runs from before call modes count as batched, so old and new runs line up on those names.
   - Two artifacts:
-    - `answers.csv`: one row per question, with the call mode, what the model returned, the truth, the decoy code for planted codes, the depth, how it was scored and, for exact fields, its `outcome`.
+    - `answers.csv`: one row per question, with the call mode, what the model returned, the truth, the decoy codes for planted codes (`decoy` in old runs, `decoys` in new ones), the depth, how it was scored and, for exact fields, its `outcome` and, for a decoy answer, `decoy_hit` (`near` or `far`).
     - `calls.json`: mode, provider, tokens, cost, latency and any error for each call.
 
 - **ICL runs** use the same layout. The parent run's parameters are the preset, `mode=icl`, the status and the datasets. Each model's child run holds `icl_acc/<dataset>/<length>` (for example `icl_acc/banking77/32k`) with Wilson 95% bounds `icl_acc_lo/...` and `icl_acc_hi/...` and the count `icl_n/...`, the same call, token and cost metrics as above, `calls.json`, and an `answers.csv` with one row per test item: dataset, length, item, text, gold label, predicted label, correct, shots and any call error. Filing runs log exactly what they did before.
@@ -105,25 +115,32 @@ uv run python -c "import runs, json; print(runs.log_mlflow(json.load(open('runs/
 
 | Field | Question | Anchor | Found in (full preset) |
 |---|---|---|---|
-| `employees` | About how many people the company employed at year end | the human capital headcount sentence ("approximately 164,000 full-time equivalent employees"), or Ford's employment table | all 7 |
+| `employees` | About how many people the company employed at year end | the human capital headcount sentence ("approximately 164,000 full-time equivalent employees"), or Ford's employment table | all but JPM |
 | `seasonality` | When in the year sales or production peak, and why | a `Seasonality` heading | AAPL, MSFT, KO, F |
 | `revenue_drivers` | What drove the change in total revenue | an MD&A sentence on *total* revenue ("total revenues increased…", "Net operating revenues were…") | MSFT, GE, KO, PFE |
+
+The three banks added to the full preset have no `seasonality` or `revenue_drivers` passage. Their real exact fields are also thinner: JPM has no employees, cash or operating income field, C and BAC no cash or operating income, and WFC no revenue, operating income or cash, because the app finds no single XBRL value for them.
 
 The passage runs from the anchor's line to the end of the line about 1,500 characters on. A filing with no anchor match drops the question; segment-level sentences ("Americas net sales increased…") are deliberately not anchors, since they answer a different question. The LLM judge grades only these real tolerant answers, each against **only the part of the passage that was in the context sent**. If less than half of the passage was sent, the question counts as not present and isn't scored, like a real exact fact that was cut off. Earlier versions asked for "the two main risk factors", which has no single right answer, and graded against the first 12,000 characters of whole sections, which often missed the answer.
 
 **Planted facts.** Near 10, 30, 50, 70 and 90% of the context that is sent, the app inserts three paragraphs, 2% apart, each with a made-up reference code (exact, for example `QX-48213-7`) and a short made-up statement (tolerant). That gives 15 exact and 15 tolerant planted questions per filing and length. Values are seeded per filing, so every model, length and mode sees the same ones.
 
-**Decoys.** Each planted code has a near-duplicate that is never asked about: the same kind of paragraph for a lookalike subject ("the Brookfield archive review" against the asked "Brookfield archive audit"), with a different code and a filler sentence. It sits 40 points deeper, wrapped into the 10–90% bins (10 to 50, 30 to 70, 50 to 90, 70 to 10, 90 to 30), plus 1%, so it falls between the 2%-spaced plants and never shares their line. Decoy codes come from their own seeded stream, so the real codes are the same as before decoys existed. An answer that gives the decoy's code is the `decoy` outcome below: the model found a paragraph, but the wrong one.
+**Decoys.** Each planted code has two near-duplicates that are never asked about: the same kind of paragraph for a lookalike subject, with a different code and a filler sentence.
+
+- **Near:** 0.5% after its target, in the same depth bin ("the Brookfield archive survey" against the asked "Brookfield archive audit"). It sits halfway between the target and the next 2%-spaced plant or far decoy, so it never shares their line.
+- **Far:** 40 points deeper, wrapped into the 10–90% bins (10 to 50, 30 to 70, 50 to 90, 70 to 10, 90 to 30), plus 1% ("the Brookfield archive review"), so it falls between the 2%-spaced plants.
+
+Each kind of decoy code comes from its own seeded stream, so the real codes and the far decoy codes are the same as in design 1, before near decoys existed. An answer that gives either decoy's code is the `decoy` outcome below: the model found a paragraph, but the wrong one. `decoy_hit` says which one (`near` or `far`). Planted code questions carry `decoys`, `decoy_targets` and `decoy_depths`, each keyed `near` and `far`; design 1 runs have a single `decoy` and `decoy_depth` instead. `DESIGN` in `context.py` is 2, and every new run file records it as `design`.
 
 **Planted tolerant answers are scored by stems, not by the judge.** Each planted statement has one or two stems, and a correct answer must contain every one as a lowercase substring. `a|b` accepts either: for "drivers reported fatigue", the stems are `driver` and `fatigu|tired|exhaust`. This is cheap, deterministic and needs no judge, but it can miss a correct paraphrase (see [Design choices and limits](#design-choices-and-limits)).
 
 **Call modes.** Each filing and length is asked in more than one way, all with the same context:
 
 - `batched`: every question in one call, as a practitioner would extract a filing. Real and planted questions are asked together.
-- `single`: one call per planted question, 30 per filing and length, so no question can interfere with another. Real questions are only batched, because single calls for them would multiply the cost.
+- `single`: one call per planted code, 15 per filing and length, so no question can interfere with another. Planted notes and real questions are only batched. Notes were at the ceiling in single mode in the [first run](#first-run) (96–100%), so single calls for them spent money without telling the models apart. Real questions would multiply the cost.
 - `closed_book`: the real questions with an empty document, once per filing, to measure what the model knows from memory. Its instruction differs from the open-book one: it says the filing is not shown, asks for an answer from memory, and the request names the company and fiscal year ("The filing is AAPL's 10-K for fiscal year 2024"). The open-book instruction says to answer from the document only, which would force null. Closed-book tolerant answers are recorded but not judged.
 
-The gap between `batched` and `single` on the same planted questions is itself a measurement: what batching costs in accuracy.
+The gap between `batched` and `single` on the same planted codes is itself a measurement: what batching costs in accuracy.
 
 **Outcomes of exact answers.** Strict accuracy is the headline, but every exact answer also gets one outcome:
 
@@ -137,7 +154,7 @@ The page shows the breakdown per model, separately for real and planted facts.
 
 **Hallucination.** Real exact facts that are not in the context aren't scored for accuracy, but they are still asked. The hallucination rate is the share of those the model answered anyway instead of returning null, from batched calls. It's an upper bound: a value printed in a form `locate` doesn't recognise counts as absent, and a model may answer correctly from memory, which closed-book calls measure.
 
-**Length.** The full preset cuts the filing to 8k, 32k and 128k tokens. A length is skipped when the filing is shorter than it, so 128k has only F, PFE and BAC. A preset can also list `"full"`, the whole filing when it fits the model, but none does now. The budget covers the whole prompt: 2,048 tokens are kept free for instructions, schema and answer. Tokens are counted with `o200k_base`. Each model's own tokenizer differs, which is why the reported prompt tokens are recorded too.
+**Length.** The full preset cuts the filing to 8k, 32k, 128k and 192k tokens. A length is skipped when the filing is shorter than it, so 32k has nine filings, 128k five and 192k three (see the table under [Run](#run)). A preset can also list `"full"`, the whole filing when it fits the model, but none does now. The budget covers the whole prompt: 2,048 tokens are kept free for instructions, schema and answer. Tokens are counted with `o200k_base`. Each model's own tokenizer differs, which is why the reported prompt tokens are recorded too.
 
 ## Judge check
 
@@ -147,17 +164,17 @@ The default check model is DeepSeek-V4-Flash, through the Hugging Face router to
 
 ## Reading the results
 
-**Heatmaps.** There are four panels: exact or tolerant, crossed with real or planted, with the models side by side in each. Rows are depth, binned to 10/30/50/70/90%. Columns are context length. A cell shows the percentage correct and the count, and a `·` means no data. Hover a cell for its Wilson 95% interval. A planted cell holds 3 questions per filing, per model and mode: 21 at 8k and 32k, and 9 at 128k, where only three filings fit. A 70% cell is roughly 50–86% at 21 answers and 35–88% at 9, so differences of a few cells' worth are noise.
+**Heatmaps.** There are four panels: exact or tolerant, crossed with real or planted, with the models side by side in each. Rows are depth, binned to 10/30/50/70/90%. Columns are context length. A cell shows the percentage correct and the count, and a `·` means no data. Hover a cell for its Wilson 95% interval. A planted cell holds 3 questions per filing, per model and mode: 30 at 8k, 27 at 32k, 15 at 128k and 9 at 192k. Planted notes are batched only, so the tolerant planted panel has no single-mode cells. A 70% cell is roughly 52–83% at 30 answers and 35–88% at 9, so differences of a few cells' worth are noise.
 
-**Pooled depth curves.** Accuracy per depth bin, pooled over lengths (the `d10` to `d90` metrics). Pooling gives each Qwen model 51 planted questions per bin (21 + 21 + 9), with a 70% point at roughly 57–81%. Claude has 21 per bin, all at 32k. The pooled curve mixes lengths, and 128k contributes fewer items, so read it for depth, and the heatmap columns for length.
+**Pooled depth curves.** Accuracy per depth bin, pooled over lengths (the `d10` to `d90` metrics). Pooling gives each Qwen model 81 planted questions per bin and mode (30 + 27 + 15 + 9), with a 70% point at roughly 60–79%. Claude has 27 per bin, all at 32k. The pooled curve mixes lengths, and the long lengths contribute fewer items, so read it for depth, and the heatmap columns for length.
 
-**Paired headline.** For each pair of models, on the planted single-mode questions both answered, the run file's `paired` list holds three gaps, per length and pooled (`all`), each with a 95% bootstrap interval:
+**Paired headline.** For each call mode and pair of models, on the planted questions both answered, the run file's `paired` list holds up to three gaps, per length and pooled (`all`), each with a 95% bootstrap interval. Each entry has a `mode`. Single entries have only `exact_gap`, since single calls ask codes only; `tolerant_gap` and `did` are null there. Batched entries have all three:
 
 - `exact_gap`: model A's accuracy minus model B's on planted codes.
 - `tolerant_gap`: the same on planted notes.
-- `did`: the difference in differences, exact gap minus tolerant gap, pairing each code with the note from the same paragraph. The post's claim predicts it is negative when A is the hybrid and B a full-attention model: the hybrid loses more on exact recall than on gist. A is whichever model comes first in `models.json`, so with the default line-up the hybrid is A.
+- `did`: the difference in differences, exact gap minus tolerant gap, pairing each code with the note from the same paragraph, in the same batched call. In design 1 it was measured in single mode. The post's claim predicts it is negative when A is the hybrid and B a full-attention model: the hybrid loses more on exact recall than on gist. A is whichever model comes first in `models.json`, so with the default line-up the hybrid is A.
 
-Pairing is by ticker, fiscal year, length and field, so each item is a like-for-like comparison. Each Qwen pair has 105 items per length at 8k and 32k and 45 at 128k (255 pooled). A pair with Claude has only the 105 at 32k. The bootstrap resamples items, not filings; see the limits below.
+Pairing is by ticker, fiscal year, length and field, so each item is a like-for-like comparison. Each Qwen pair has 15 codes per filing and length: 150 at 8k, 135 at 32k, 75 at 128k and 45 at 192k (405 pooled), in each mode. In batched mode the same counts hold for notes and for `did` pairs. A pair with Claude has only the 135 at 32k. The bootstrap resamples items, not filings; see the limits below.
 
 **Engineering table.** Per model and mode, the numbers a practitioner would act on:
 
@@ -172,14 +189,31 @@ Pairing is by ticker, fiscal year, length and field, so each item is a like-for-
 - Real facts only count when they are inside the context that was sent. At 8k, most financial figures are cut off. Real facts also cluster: cover-page items near 0%, the financial statements around 60–80%. **Use the planted panels for clean depth curves** and the real panels to check that the effect holds on real content.
 - The post's claim predicts this: the exact panels fade for the hybrid as length grows or as facts sit deeper, while the tolerant panels stay flat for both models.
 
+## First run
+
+`runs/20261114-170402-full.json` is the first full grid, in design 1: seven filings, 8k to 128k, one far decoy per code, single calls for codes and notes, no backoff. 1,292 calls. What it showed:
+
+- **Tolerant recall was at the ceiling.** Planted notes scored 96–100% for every model, length and mode, and judged real tolerant answers 100%. They couldn't separate the models.
+- **Almost every exact miss was a decoy.** Of 56 wrong planted code answers, 48 gave the far decoy's code. The rest were 7 abstentions and 1 near miss, all from Qwen3-235B in single mode.
+- **The hybrid fell at 128k in batched mode,** to 73% (33 of 45) against 100% for Qwen3-235B. Only F and PFE fell, 9 of 15 each, and every miss was a decoy; BAC stayed at 15 of 15. That is two filings, not a length curve.
+- **Latency.** Median batched latency was 194.5 s for Qwen3-235B, 28.5 s for the hybrid and 9.6 s for Claude. It includes provider queueing, so it is not an architecture measurement.
+- **Memory.** Closed-book, Claude answered 71% of real exact facts (40 of 56), against 11% for Qwen3-235B and 5% for the hybrid.
+- **Failures.** 8 calls failed: three on 429, three on 504 and two on 503.
+- **Cost.** $3.91, about 4% above the $3.76 estimate.
+
+These motivated design 2: near decoys, to make the exact task harder where it was nearly at the ceiling; single calls for codes only, with the difference in differences moved to batched mode; JPM, C and the 192k length, so the long end rests on more than BAC; backoff on transient errors; and retrying failed calls.
+
 ## Design choices and limits
 
-- **The bootstrap resamples items, not filings.** Questions from one filing are correlated, so the paired intervals are narrower than they should be. With 7 filings, a bootstrap over filings would be too coarse to be useful. It is worth switching once there are a few dozen filings.
-- **7 filings.** Every per-filing effect (layout, length, how the company writes) rests on seven documents, and 128k on three.
+- **Don't pool design 1 and design 2 runs.** Near decoys make the exact task harder than in design 1, and design 1's single calls asked notes too, so accuracy, decoy rates and paired stats aren't comparable across designs. Compare runs with the same `design` (none means 1).
+- **The bootstrap resamples items, not filings.** Questions from one filing are correlated, so the paired intervals are narrower than they should be. With 10 filings, a bootstrap over filings would be too coarse to be useful. It is worth switching once there are a few dozen filings.
+- **10 filings, fewer at length.** Every per-filing effect (layout, length, how the company writes) rests on ten documents at 8k, five at 128k and three at 192k. Three of the five 128k filings, and all three at 192k, are banks, so the long end leans on one kind of filing.
+- **Retries change the timing, not the context.** A retried call sends the same context, rebuilt from the code, but at a later time and maybe to a less busy provider. Its latency isn't comparable to the original calls'.
 - **Stems can miss paraphrases.** A correct planted note answer that uses none of a stem's words ("the trucks' crews were worn out") counts as wrong. Stems trade that for a deterministic score with no judge in the loop.
 - **The closed-book instruction differs from the open-book one.** It has to: the open-book one says to answer from the document only. So closed-book accuracy is memory under a different prompt, not the same call with the document removed.
 - **Latency includes provider queueing.** It is wall-clock time per call through the router or `claude -p`, on shared hardware, so it isn't an architecture measurement. Compare modes within one model rather than models.
 - **Claude runs at 32k only.** It uses subscription quota, so it has no length curve, and its paired comparisons cover one length.
+- **Single mode asks codes only.** So there is no single-mode tolerant panel, and batching cost is measured on codes only.
 
 ## HELMET ICL mode
 
@@ -269,16 +303,16 @@ If the recurrent state is kept in fp32, as some kernels do, it doubles to about 
 - `app.py`: the web API and `main()`.
 - `edgar.py`: EDGAR fetching and caching, HTML to text, passage finding, the exact and tolerant questions and ground truth.
 - `scoring.py`: number and date parsing, exact match, outcomes (decoy included), stems, locating facts, Wilson intervals, the paired bootstrap and judge agreement.
-- `context.py`: planted facts and their decoys, truncation and token counting, and building the context sent.
-- `llm.py`: `models.json`, the OpenRouter and Hugging Face price listings, JSON schema to pydantic, model calls (Instructor and Claude Code) with their latency, extraction and the judge.
+- `context.py`: the planted design number, planted facts and their near and far decoys, truncation and token counting, and building the context sent.
+- `llm.py`: `models.json`, the OpenRouter and Hugging Face price listings, JSON schema to pydantic, model calls (Instructor and Claude Code) with their latency, backoff on transient errors, extraction and the judge.
 - `icl.py`: HELMET's ICL data (BANKING77 and CLINC150 from Hugging Face), demo balancing, label remapping, test-item selection and prompt building.
-- `runs.py`: presets, call modes, cost estimates, the run and judge-check lifecycle, per-mode metrics, the paired headline, ICL scoring, and MLflow logging.
+- `runs.py`: presets, call modes, cost estimates, the run, retry and judge-check lifecycle, per-mode metrics, the paired headline, ICL scoring, and MLflow logging.
 - `paths.py`: the shared paths.
 - `index.html`: the single page.
 - `models.json`: endpoints and models.
 - `runs/`: one JSON file per run, committed because the post's figures are drawn from them.
 - `mlflow.db`, `mlruns/`: the local MLflow store (git-ignored).
-- `tests/`: normalisation, planting depth, decoy placement, truncation, exact-match and outcome scoring (decoy included), stems, passage finding and clipping, Wilson intervals, call modes in the plan and in scoring, the metrics (old runs included), the paired bootstrap, Hugging Face pricing and the judge-check agreement; for ICL, demo balancing, prompt budget, label remapping, test and demo separation, determinism, the plan's model lengths, the metrics and MLflow logging.
+- `tests/`: normalisation, planting depth, near and far decoy placement, truncation, exact-match and outcome scoring (decoy and `decoy_hit` included), backoff on transport failures, retrying a run's failed calls, stems, passage finding and clipping, Wilson intervals, call modes in the plan and in scoring, the metrics (old runs included), the paired bootstrap, Hugging Face pricing and the judge-check agreement; for ICL, demo balancing, prompt budget, label remapping, test and demo separation, determinism, the plan's model lengths, the metrics and MLflow logging.
 - `.cache/`: EDGAR responses and converted text, and the ICL parquet files under `.cache/icl/` (git-ignored).
 
 Not in scope: auth, a database, deployment, PDF parsing, self-hosted models, and architecture speed or memory measurements, which an API can't show. The latency recorded per call includes the provider's queueing, and the memory figures above are arithmetic from configs.

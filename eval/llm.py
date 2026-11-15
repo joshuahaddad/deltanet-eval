@@ -2,12 +2,13 @@
 
 import json
 import os
+import random
 import subprocess
 import time
 
 import httpx
 import instructor
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 from pydantic import BaseModel, Field, create_model
 
 from paths import CACHE, HERE
@@ -102,6 +103,16 @@ def call_claude_code(cfg: dict, messages: list[dict], response_model: type[BaseM
     }
 
 
+RETRY_STATUS = {429, 500, 502, 503, 504}
+BACKOFF_S = (10, 30, 60)  # waits before each extra attempt after a transport failure
+
+
+def transient(e: Exception) -> bool:
+    """A busy or failing provider, worth another attempt; Instructor wraps the API error as the cause."""
+    e = e.__cause__ or e
+    return isinstance(e, (APITimeoutError, httpx.TimeoutException)) or getattr(e, "status_code", None) in RETRY_STATUS
+
+
 def call(cfg: dict, messages: list[dict], response_model: type[BaseModel]) -> tuple[dict, dict]:
     t = time.perf_counter()
     if cfg.get("provider") == "claude-code":
@@ -112,9 +123,17 @@ def call(cfg: dict, messages: list[dict], response_model: type[BaseModel]) -> tu
         raise RuntimeError(f"Set {cfg['api_key_env']} for {cfg['name']}")
     client = instructor.from_openai(OpenAI(base_url=cfg["base_url"], api_key=key), mode=instructor.Mode.JSON)
     extra = {"usage": {"include": True}} if "openrouter.ai" in cfg["base_url"] else {}
-    obj, completion = client.chat.completions.create_with_completion(
-        model=cfg["model"], messages=messages, response_model=response_model, max_retries=2,
-        temperature=0, max_tokens=4096, extra_body=extra)
+    for attempt, wait in enumerate((*BACKOFF_S, None), 1):  # max_retries below covers validation failures only
+        t = time.perf_counter()  # latency is the attempt that answered, without the backoff
+        try:
+            obj, completion = client.chat.completions.create_with_completion(
+                model=cfg["model"], messages=messages, response_model=response_model, max_retries=2,
+                temperature=0, max_tokens=4096, extra_body=extra)
+            break
+        except Exception as e:
+            if wait is None or not transient(e):
+                raise
+            time.sleep(wait * random.uniform(1, 1.2))
     latency, usage = round(time.perf_counter() - t, 3), completion.usage
     cost = (usage.model_extra or {}).get("cost") if usage else None
     price = catalogue(cfg).get("pricing")
@@ -124,7 +143,7 @@ def call(cfg: dict, messages: list[dict], response_model: type[BaseModel]) -> tu
         "provider": getattr(completion, "provider", None),
         "prompt_tokens": usage.prompt_tokens if usage else None,
         "completion_tokens": usage.completion_tokens if usage else None,
-        "cost": cost, "latency_s": latency,
+        "cost": cost, "latency_s": latency, "attempts": attempt,
     }
 
 

@@ -91,13 +91,18 @@ def near_miss(answer, truth, typ: str) -> bool:
 OUTCOMES = ("correct", "decoy", "near_miss", "wrong", "abstained")
 
 
-def outcome(answer, truth, typ: str, decoy=None) -> str:
+def decoy_hit(answer, decoys: dict | None, typ: str) -> str | None:
+    """Which decoy ("near" or "far") the answer gives, if any."""
+    return next((k for k, d in (decoys or {}).items() if exact_match(answer, d, typ)), None)
+
+
+def outcome(answer, truth, typ: str, decoys: dict | None = None) -> str:
     if answer is None or str(answer).strip().lower() in ("", "null", "none", "n/a"):
         return "abstained"
     if exact_match(answer, truth, typ):
         return "correct"
-    if decoy is not None and exact_match(answer, decoy, typ):
-        return "decoy"  # the lookalike planted elsewhere: retrieval found the wrong paragraph
+    if decoy_hit(answer, decoys, typ):
+        return "decoy"  # a planted lookalike: retrieval found the wrong paragraph
     return "near_miss" if near_miss(answer, truth, typ) else "wrong"
 
 

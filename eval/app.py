@@ -11,7 +11,7 @@ from context import RESERVE, n_tokens, truncate
 from edgar import get_filing, html_to_text
 from llm import CONFIG, context_limit, extract, model_cfg
 from paths import HERE, RUNS
-from runs import PRESETS, estimate, start_judge_check, start_run
+from runs import PRESETS, estimate, start_judge_check, start_retry, start_run
 
 app = FastAPI(title="filing-recall")
 
@@ -71,6 +71,17 @@ def post_judge_check(rid: str):
     return {"id": rid}
 
 
+@app.post("/api/runs/{rid}/retry")
+def post_retry(rid: str):  # re-run only the failed calls of a finished run
+    if not re.fullmatch(r"[\w-]+", rid) or not (RUNS / f"{rid}.json").exists():
+        raise HTTPException(404)
+    try:
+        start_retry(rid)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    return {"id": rid}
+
+
 @app.post("/api/extract")
 def post_extract(model: str = Form(...), json_schema: str = Form(...), ticker: str = Form(""), fy: str = Form(""),
                  file: UploadFile | None = File(None)):
@@ -93,7 +104,7 @@ def post_extract(model: str = Form(...), json_schema: str = Form(...), ticker: s
 
 def main():
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 8765)))
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 8780)))
 
 
 if __name__ == "__main__":

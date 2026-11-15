@@ -54,16 +54,17 @@
   <div id="heatmaps"></div>
   <div id="filingonly">
   <h3>Exact answers by outcome</h3>
-  <p class="muted">Share of scored exact answers per outcome, in the selected mode. Decoy: the model returned the code of the
-    lookalike planted elsewhere. Hallucinated: real exact facts that were not in the context, answered anyway.</p>
+  <p class="muted">Share of scored exact answers per outcome, in the selected mode. Decoy: the model returned the code of a
+    planted lookalike, near (same depth bin, just after the target) or far (40 points of depth away). Hallucinated: real exact facts that were not in the context, answered anyway.</p>
   <div class="scroll"><table class="calls" id="outcomes"></table></div>
   <h3>Engineering</h3>
   <p class="muted">The practitioner's view, per model. Single: one planted question per call over the same context, so
     batched vs single is the cost of batching. Closed book: real questions with no document. Cost is the billed cost, or
     list price marked notional where the model runs on a subscription. Hover a rate for its 95% interval.</p>
   <div class="scroll"><table class="calls" id="eng"></table></div>
-  <h3>Judge check</h3>
+  <h3>Judge check and retry</h3>
   <div class="row"><button id="jcheck">Check judge</button> <span id="jcinfo" class="muted"></span></div>
+  <div class="row"><button id="retry">Retry failed calls</button> <span id="retryinfo" class="muted"></span></div>
   </div>
   <h3>Calls</h3>
   <div class="scroll"><table class="calls" id="calls"></table></div>
@@ -96,7 +97,9 @@ const $ = id => document.getElementById(id);
 const DEPTH_BINS = [10, 30, 50, 70, 90];
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const lenLabel = l => l == null ? "·" : l === "full" ? "full" : `${l / 1024}k`;
-const OUTCOMES = ["correct", "decoy", "near_miss", "wrong", "abstained"];
+const OUTCOMES = ["correct", "decoy_near", "decoy_far", "near_miss", "wrong", "abstained"];
+// a decoy answer names which lookalike it gave; runs from before near decoys had only the far one
+const oc = f => f.outcome === "decoy" ? `decoy_${f.decoy_hit ?? "far"}` : f.outcome;
 const rmode = r => r.mode ?? "batched";  // runs from before call modes were all batched
 const bin = f => DEPTH_BINS[Math.min(4, Math.floor(f.depth * 5))];
 // [result, field] pairs of scored facts; by default only facts that were in the context
@@ -175,8 +178,9 @@ async function showRun(id) {
   const lengths = [...new Set(inMode.map(r => r.length))]
     .sort((a, b) => (a === "full" ? Infinity : a) - (b === "full" ? Infinity : b));
   const sources = mode === "batched" ? ["real", "planted"] : ["planted"];  // real questions are only asked batched
+  const kinds = ["exact", "tolerant"].filter(k => facts(inMode, k, "planted").length);  // single asks codes only
   let html = headline(run.paired ?? []);
-  for (const kind of ["exact", "tolerant"]) for (const source of sources) {
+  for (const kind of kinds) for (const source of sources) {
     html += `<h3>${kind} · ${source} facts · ${mode}</h3><div class="panels">`;
     for (const model of models) {
       const c = tally(facts(inMode.filter(r => r.model === model), kind, source), (r, f) => `${bin(f)}|${r.length}`);
@@ -188,7 +192,7 @@ async function showRun(id) {
   }
   html += `<h3>Planted facts, pooled · ${mode}</h3><p class="muted">Accuracy vs length (depths pooled) and vs depth
     (lengths pooled). Hover a cell for its 95% Wilson interval.</p><div class="panels">`;
-  for (const kind of ["exact", "tolerant"])
+  for (const kind of kinds)
     for (const [axis, cols, key, lab] of [["length", lengths, r => r.length, lenLabel], ["depth", DEPTH_BINS, (r, f) => bin(f), b => `${b}%`]]) {
       html += `<div><div>${kind} vs ${axis}</div><table class="hm"><tr><th>model</th>${cols.map(x => `<th>${lab(x)}</th>`).join("")}</tr>`;
       for (const model of models) {
@@ -205,7 +209,7 @@ async function showRun(id) {
     const scored = fs.filter(f => f.depth != null), absent = fs.filter(f => f.depth == null);
     const halluc = source === "real" ? pct(absent.filter(f => f.outcome !== "abstained").length, absent.length) : "";
     rows += `<tr><td>${esc(model)}</td><td>${source}</td>` +
-      OUTCOMES.map(o => `<td>${pct(scored.filter(f => f.outcome === o).length, scored.length)}</td>`).join("") +
+      OUTCOMES.map(o => `<td>${pct(scored.filter(f => oc(f) === o).length, scored.length)}</td>`).join("") +
       `<td>${halluc}</td></tr>`;
   }
   $("outcomes").innerHTML = `<tr><th>model</th><th>facts</th>${OUTCOMES.map(o => `<th>${o.replace("_", " ")}</th>`).join("")}
@@ -213,32 +217,49 @@ async function showRun(id) {
   $("eng").innerHTML = engineering(run);
   const jc = run.judge_check;
   const f2 = x => x == null ? "n/a" : x.toFixed(2);
-  $("jcheck").disabled = run.status === "running" || jc?.status === "running";
+  const rt = run.retry, failed = run.results.filter(r => r.error).length;
+  // the server runs one job per run file at a time
+  $("jcheck").disabled = $("retry").disabled = run.status === "running" || jc?.status === "running" || rt?.status === "running";
+  $("retry").hidden = !failed || rt?.status === "running";
+  $("retryinfo").innerHTML = rt?.status === "running" ? `Retrying ${esc(rt.calls)} failed calls…` :
+    rt?.status === "error" ? `<span class="err">Retry failed: ${esc(rt.error)}</span>` :
+    rt?.status === "done" ? `Retried ${esc(rt.calls)} calls, ${esc(rt.still_failed)} still failed (${esc(rt.finished)})` +
+      (rt.previous_mlflow_run_id ? ` · previous MLflow ${esc(rt.previous_mlflow_run_id.slice(0, 8))}` : "") :
+    failed ? `${failed} failed calls. Re-runs them in place and logs a new MLflow run.` : "";
   $("jcinfo").innerHTML = !jc ? "Re-grades a fixed sample of tolerant answers with a second judge. Not run automatically." :
     jc.status === "running" ? `Running (${esc(jc.judge)})…` :
     jc.status === "error" ? `<span class="err">${esc(jc.error)}</span>` :
     `${esc(jc.judge)} vs ${esc(jc.first_judge)}: agreement ${jc.agreement == null ? "n/a" : Math.round(100 * jc.agreement) + "%"}
      on ${jc.n} answers, Cohen's κ ${f2(jc.kappa)}` + (jc.errors ? ` · ${jc.errors} failed` : "") +
     (jc.mlflow_error ? ` <span class="err">MLflow: ${esc(jc.mlflow_error)}</span>` : "");
+  const att = run.results.some(r => r.attempts != null);  // runs before retries have none
   $("calls").innerHTML = `<tr><th>model</th><th>filing</th><th>mode</th><th>length</th><th>provider</th><th>tokens sent (local / reported)</th>
-    <th>out</th><th>cost</th><th>result</th></tr>` + run.results.map(r => `<tr><td>${esc(r.model)}</td><td>${esc(r.ticker)} FY${esc(r.fy)}</td>
+    <th>out</th><th>cost</th>${att ? "<th>attempts</th>" : ""}<th>result</th></tr>` + run.results.map(r => `<tr><td>${esc(r.model)}</td><td>${esc(r.ticker)} FY${esc(r.fy)}</td>
     <td>${rmode(r).replace("_", " ")}</td><td>${lenLabel(r.length)}</td><td>${esc(r.provider ?? "")}</td><td>${esc(r.context_tokens)} / ${esc(r.prompt_tokens ?? "")}</td>
-    <td>${esc(r.completion_tokens ?? "")}</td><td>${r.cost != null ? "$" + r.cost.toFixed(4) : ""}</td>
+    <td>${esc(r.completion_tokens ?? "")}</td><td>${r.cost != null ? "$" + r.cost.toFixed(4) : ""}</td>${att ? `<td>${esc(r.attempts ?? "")}</td>` : ""}
     <td>${r.error ? `<span class="err">${esc(r.error)}</span>` : ((sc => `${sc.filter(f => f.correct).length}/${sc.length} correct`)(r.fields.filter(f => f.correct != null &&
       (f.depth != null || r.mode === "closed_book"))))}</td></tr>`).join("");
 }
 
-function headline(paired) {  // run.paired: paired bootstrap on planted single-call items
-  if (!paired.length) return `<h3>Model gaps</h3><p class="muted">No paired stats in this run (they need single-mode calls from two models).</p>`;
+function headline(paired) {  // run.paired: paired bootstrap on planted items, per call mode
+  if (!paired.length) return `<h3>Model gaps</h3><p class="muted">No paired stats in this run (they need planted answers from two models).</p>`;
   const sgn = x => `${x > 0 ? "+" : ""}${Math.round(100 * x)}`;
   const ci = s => !s?.n ? "·" : `${sgn(s.est)} <small class="muted">[${sgn(s.lo)}, ${sgn(s.hi)}] n=${s.n}</small>` +
     (s.lo <= 0 && s.hi >= 0 ? ` <small class="muted">· includes 0</small>` : "");
-  return `<h3>Model gaps</h3><p class="muted">Percentage points, 95% paired bootstrap interval, on planted single-call items.
-    Gap = accuracy(a) − accuracy(b). Exact − tolerant gap (DiD) &gt; 0: a's lead is larger on exact recall than on gist.
-    An interval that includes 0 is no evidence of a difference.</p><div class="scroll"><table class="calls">
-    <tr><th>a vs b</th><th>length</th><th>exact gap</th><th>tolerant gap</th><th>exact − tolerant gap</th></tr>` +
-    paired.map(p => `<tr><td>${esc(p.a)} vs ${esc(p.b)}</td><td>${esc(p.length)}</td><td>${ci(p.exact_gap)}</td>
-      <td>${ci(p.tolerant_gap)}</td><td>${ci(p.did)}</td></tr>`).join("") + "</table></div>";
+  let html = `<h3>Model gaps</h3><p class="muted">Percentage points, 95% paired bootstrap interval, on planted items both
+    models answered. Gap = accuracy(a) − accuracy(b). Exact − tolerant gap (DiD) &gt; 0: a's lead is larger on exact recall
+    than on gist; it pairs each code with its note from the same batched call. Single calls ask codes only.
+    An interval that includes 0 is no evidence of a difference.</p>`;
+  for (const mode of ["batched", "single"]) {
+    const ps = paired.filter(p => (p.mode ?? "single") === mode);  // entries from before modes were single calls
+    if (!ps.length) continue;
+    const tol = ps.some(p => p.tolerant_gap || p.did);  // old single entries still carry them
+    html += `<div>${mode}</div><div class="scroll"><table class="calls"><tr><th>a vs b</th><th>length</th><th>exact gap</th>` +
+      (tol ? `<th>tolerant gap</th><th>exact − tolerant gap</th>` : "") + "</tr>" +
+      ps.map(p => `<tr><td>${esc(p.a)} vs ${esc(p.b)}</td><td>${esc(p.length)}</td><td>${ci(p.exact_gap)}</td>` +
+        (tol ? `<td>${ci(p.tolerant_gap)}</td><td>${ci(p.did)}</td>` : "") + "</tr>").join("") + "</table></div>";
+  }
+  return html;
 }
 
 function engineering(run) {
@@ -252,7 +273,8 @@ function engineering(run) {
       add(`planted ${kind} · ${m}`, acc(facts(of(m), kind, "planted")));
     for (const m of ["batched", "single"]) {
       const ps = facts(of(m), "exact", "planted").filter(([, f]) => f.outcome);
-      add(`decoy rate · ${m}`, pct(ps.filter(([, f]) => f.outcome === "decoy").length, ps.length));
+      for (const d of ["near", "far"])
+        add(`${d} decoy rate · ${m}`, pct(ps.filter(([, f]) => oc(f) === `decoy_${d}`).length, ps.length));
     }
     const absent = facts(of("batched"), "exact", "real", f => f.depth == null && f.outcome);
     add("hallucinated · batched", pct(absent.filter(([, f]) => f.outcome !== "abstained").length, absent.length));
@@ -287,8 +309,13 @@ async function start(preset) {
       const e = await api(`/api/estimate/${preset}`);
       const unpriced = e.unpriced_models.length ? ` (no price for ${e.unpriced_models.join(", ")})` : "";
       const toks = Object.entries(e.input_tokens).map(([m, t]) => `${m}: ${(t / 1e6).toFixed(2)}M`).join("; ");
+      const per = Object.entries(e.usd_per_model ?? {}).map(([m, u]) => `${m}: $${u.toFixed(2)}`).join("; ");
+      const miss = e.missing_filings?.length ?
+        // plan() at run time has no missing list, so a filing that still fails stops the run
+        `\nCould not load, so not in this estimate (the run fetches them again and errors if one still fails):\n${e.missing_filings.join("\n")}` : "";
       if (!confirm(`${preset === "icl" ? "ICL grid" : "Full grid"}: ${e.calls} extraction calls, about $${e.usd.toFixed(2)}${unpriced}.
-Input tokens: ${toks}. Start?`)) { $("msg").textContent = ""; return; }
+Input tokens: ${toks}.${per ? `\nCost per model: ${per}.` : ""}${miss}
+Start?`)) { $("msg").textContent = ""; return; }
     }
     const {id} = await api(`/api/runs/${preset}`, {method: "POST"});
     $("msg").textContent = `Started ${id}`;
@@ -306,18 +333,20 @@ $("full").onclick = () => start("full");
 $("icl-smoke").onclick = () => start("icl-smoke");
 $("icl").onclick = () => start("icl");
 $("runs").onchange = $("hmode").onchange = () => showRun($("runs").value);
-$("jcheck").onclick = async () => {
+async function job(path, key, info) {  // start a background job on the run, then poll while run[key] is running
   const id = $("runs").value;
   try {
-    await api(`/api/runs/${encodeURIComponent(id)}/judge-check`, {method: "POST"});
+    await api(`/api/runs/${encodeURIComponent(id)}/${path}`, {method: "POST"});
     await showRun(id);
     const poll = setInterval(async () => {
       const run = await api(`/api/runs/${encodeURIComponent(id)}`);
       if ($("runs").value === id) showRun(id);
-      if (run.judge_check?.status !== "running") clearInterval(poll);
+      if (run[key]?.status !== "running") clearInterval(poll);
     }, 3000);
-  } catch (err) { $("jcinfo").innerHTML = `<span class="err">${esc(err.message)}</span>`; }
-};
+  } catch (err) { $(info).innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+}
+$("jcheck").onclick = () => job("judge-check", "judge_check", "jcinfo");
+$("retry").onclick = () => job("retry", "retry", "retryinfo");
 
 $("uextract").onclick = async () => {
   const fd = new FormData();

@@ -11,20 +11,21 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import icl
-from context import DEPTHS, RESERVE, build_context, n_tokens, planted_facts
+from context import DEPTHS, DESIGN, RESERVE, build_context, n_tokens, planted_facts
 from edgar import get_filing
-from llm import CONFIG, catalogue, context_limit, extract, judge
+from llm import CONFIG, catalogue, context_limit, extract, judge, model_cfg
 from paths import HERE, RUNS
-from scoring import OUTCOMES, agreement, bootstrap_mean, exact_match, has_stems, outcome, wilson
+from scoring import OUTCOMES, agreement, bootstrap_mean, decoy_hit, exact_match, has_stems, outcome, wilson
 
 PRESETS = {
-    # every call mode once per model: closed book, batched, and a single call per planted question
+    # every call mode once per model: closed book, batched, and a single call per planted code
     "smoke": {"filings": [["AAPL", 2024]], "lengths": [8192],
               "fields": ["fiscal_year_end", "revenue", "planted_code_50b", "planted_note_50b"]},
-    # 45k to 208k tokens, so the 128k column is real; lengths may also hold "full" (the whole filing, if it fits)
+    # 21k to 299k tokens, so the 128k and 192k columns are real; lengths may also hold "full" (the whole filing, if
+    # it fits). 192k stays inside Qwen's 262k window even with its own tokenizer
     "full": {"filings": [["AAPL", 2024], ["MSFT", 2024], ["GE", 2024], ["KO", 2024], ["F", 2024], ["PFE", 2024],
-                         ["BAC", 2024]],
-             "lengths": [8192, 32768, 131072], "fields": None,
+                         ["BAC", 2024], ["JPM", 2024], ["C", 2024], ["WFC", 2024]],
+             "lengths": [8192, 32768, 131072, 196608], "fields": None,
              "model_lengths": {"claude-code": [32768]}},  # Claude runs on subscription quota
     # HELMET many-shot ICL: one call per test item; model_lengths limits a model (by name or provider) to some lengths
     "icl-smoke": {"mode": "icl", "datasets": ["banking77"], "lengths": [32768], "items": 5},
@@ -38,20 +39,28 @@ def model_lengths(p: dict, cfg: dict) -> list:
     return allowed.get(cfg["name"], allowed.get(cfg.get("provider"), p["lengths"]))
 
 
-def plan(preset: str) -> list[tuple]:
+def plan(preset: str, missing: list | None = None) -> list[tuple]:
     """Every call in a preset: (filing, budget, model, mode, field), or (dataset, length, model, test item) for ICL.
-    Per filing and length a model gets one batched call and one single call per planted question, plus one
-    closed-book call per filing. Skips lengths past the filing or the model's window."""
+    Per filing and length a model gets one batched call and one single call per planted code, plus one
+    closed-book call per filing. Skips lengths past the filing or the model's window. With a missing list, a filing
+    that can't be loaded is noted there and skipped instead of raising."""
     p = PRESETS[preset]
     if p.get("mode") == "icl":
         return [(name, length, cfg, item) for name in p["datasets"] for item in icl.test_items(name, p["items"])
                 for cfg in CONFIG["models"] for length in model_lengths(p, cfg) if length <= context_limit(cfg)]
     tasks = []
     for ticker, fy in p["filings"]:
-        filing = get_filing(ticker, fy)
+        try:
+            filing = get_filing(ticker, fy)
+        except Exception as e:
+            if missing is None:
+                raise
+            missing.append(f"{ticker} FY{fy}: {type(e).__name__}: {e}")
+            continue
         full = n_tokens(filing["text"]) + RESERVE + 500
+        # tolerant answers were at the ceiling, so single calls ask codes only; notes stay in the batched call
         planted = [q["field"] for q in planted_facts(f"{filing['ticker']}-{filing['fy']}")
-                   if not p["fields"] or q["field"] in p["fields"]]
+                   if q["kind"] == "exact" and (not p["fields"] or q["field"] in p["fields"])]
         for cfg in CONFIG["models"]:
             budgets = [None if length == "full" else length for length in model_lengths(p, cfg)
                        if (full if length == "full" else length) <= context_limit(cfg) and (length == "full" or length < full)]
@@ -80,8 +89,8 @@ CALL_TOKENS = {"batched": (1500, 1500), "single": (300, 100), "closed_book": (60
 
 
 def estimate(preset: str) -> dict:
-    p, cost, unknown, tokens, calls, prompts = PRESETS[preset], 0.0, set(), {}, {}, {}
-    tasks = plan(preset)
+    p, cost, unknown, tokens, calls, prompts, usd, missing = PRESETS[preset], 0.0, set(), {}, {}, {}, {}, []
+    tasks = plan(preset, missing)
     jp = None if p.get("mode") == "icl" else catalogue(CONFIG["judge"]).get("pricing")
     for task in tasks:
         cfg = task[2]
@@ -109,9 +118,11 @@ def estimate(preset: str) -> dict:
         if not price:
             unknown.add(cfg["name"] + (" (Claude Code)" if cfg.get("provider") == "claude-code" else ""))
             continue
-        cost += sent * float(price["prompt"]) + out * float(price["completion"])
+        c = sent * float(price["prompt"]) + out * float(price["completion"])
+        cost, usd[cfg["name"]] = cost + c, usd.get(cfg["name"], 0) + c
     return {"preset": preset, "calls": len(tasks), "usd": round(cost, 4), "unpriced_models": sorted(unknown),
-            "input_tokens": tokens, "calls_per_model": calls}
+            "input_tokens": tokens, "calls_per_model": calls, "usd_per_model": {k: round(v, 4) for k, v in usd.items()},
+            "missing_filings": missing}
 
 
 CLOSED_BOOK = (
@@ -147,7 +158,9 @@ def score_task(filing: dict, budget: int | None, cfg: dict, mode: str, field: st
         q["present"] = q["depth"] is not None
         if q["kind"] == "exact":
             q["correct"] = exact_match(q["answer"], q["truth"], q["type"])
-            q["outcome"] = outcome(q["answer"], q["truth"], q["type"], q.get("decoy"))
+            q["outcome"] = outcome(q["answer"], q["truth"], q["type"], q.get("decoys"))
+            if q["outcome"] == "decoy":
+                q["decoy_hit"] = decoy_hit(q["answer"], q["decoys"], q["type"])
         elif q["source"] == "planted":
             q["correct"] = has_stems(q["answer"], q["stems"])
         elif q["present"]:  # closed-book tolerant answers are recorded but not judged
@@ -185,7 +198,8 @@ def start_run(preset: str) -> str:
     rid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{preset}"
     p = PRESETS[preset]
     is_icl = p.get("mode") == "icl"
-    run = {"id": rid, "preset": preset, "status": "running", "started": dt.datetime.now().isoformat(timespec="seconds"),
+    run = {"id": rid, "preset": preset, "design": DESIGN, "status": "running",
+           "started": dt.datetime.now().isoformat(timespec="seconds"),
            "judge": None if is_icl else CONFIG["judge"]["model"], "models": [{k: m.get(k) for k in ("name", "model", "base_url", "provider")}
                                                          for m in CONFIG["models"]], "results": []}
     lock = threading.Lock()
@@ -217,11 +231,8 @@ def start_run(preset: str) -> str:
         except Exception as e:
             run["status"], run["error"] = "error", f"{type(e).__name__}: {e}"
         run["finished"] = dt.datetime.now().isoformat(timespec="seconds")
-        run["total_cost"] = sum((r.get("cost") or 0) + (r.get("judge_cost") or 0) for r in run["results"])
-        try:
-            run["mlflow_run_id"] = log_mlflow(run)
-        except Exception as e:  # the run file is the record; MLflow is a copy, so a logging failure doesn't fail the run
-            run["mlflow_error"] = f"{type(e).__name__}: {e}"
+        run["total_cost"] = total_cost(run)
+        relog_mlflow(run)
         save_run(run)
 
     save_run(run)
@@ -229,8 +240,70 @@ def start_run(preset: str) -> str:
     return rid
 
 
+def busy(run: dict) -> bool:  # each job rewrites the whole run file, so only one may run at a time
+    return run["status"] == "running" or any((run.get(k) or {}).get("status") == "running" for k in ("retry", "judge_check"))
+
+
+def total_cost(run: dict) -> float:
+    return sum((r.get("cost") or 0) + (r.get("judge_cost") or 0) for r in run["results"])
+
+
+def relog_mlflow(run: dict):
+    try:
+        run["mlflow_run_id"] = log_mlflow(run)
+    except Exception as e:  # the run file is the record; MLflow is a copy, so a logging failure doesn't fail the run
+        run["mlflow_error"] = f"{type(e).__name__}: {e}"
+
+
+def start_retry(rid: str):
+    """Re-run only the calls of a finished filing run that failed, replacing them in place, then recompute paired
+    stats and total cost and log a new MLflow run. Only for a run made by the current planted design, because the
+    contexts are rebuilt from the code."""
+    run = json.loads((RUNS / f"{rid}.json").read_text())
+    if run.get("mode") == "icl":
+        raise RuntimeError("retry covers filing runs only")
+    if busy(run):
+        raise RuntimeError("wait for the run, retry or judge check to finish")
+    if run.get("design") != DESIGN:
+        raise RuntimeError(f"run has planted design {run.get('design')} and the code has {DESIGN}; "
+                           "its contexts can't be rebuilt")
+    todo = [i for i, r in enumerate(run["results"]) if r.get("error")]
+    run["retry"] = {"status": "running", "calls": len(todo), "previous_mlflow_run_id": run.get("mlflow_run_id")}
+    save_run(run)
+    lock, fields, filings = threading.Lock(), PRESETS[run["preset"]]["fields"], {}
+
+    def task(r):
+        key = (r["ticker"], r["fy"])
+        if key not in filings:
+            filings[key] = get_filing(*key)
+        budget = None if r["length"] in (None, "full") else r["length"]
+        field = r["fields"][0]["field"] if r["mode"] == "single" else None
+        return filings[key], budget, model_cfg(r["model"]), r["mode"], field
+
+    def work():
+        try:
+            tasks = {i: task(run["results"][i]) for i in todo}
+            with ThreadPoolExecutor(8) as pool, ThreadPoolExecutor(4) as claude_pool:
+                futures = {(claude_pool if t[2].get("provider") == "claude-code" else pool).submit(
+                    score_task, *t, fields): i for i, t in tasks.items()}
+                for f in as_completed(futures):
+                    with lock:
+                        run["results"][futures[f]] = f.result()
+                        save_run(run)
+            run["paired"] = paired(run["results"])
+            run["retry"] |= {"status": "done", "still_failed": sum(1 for i in todo if run["results"][i].get("error"))}
+        except Exception as e:
+            run["retry"] |= {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        run["retry"]["finished"] = dt.datetime.now().isoformat(timespec="seconds")
+        run["total_cost"] = total_cost(run)
+        relog_mlflow(run)  # a new MLflow run; the old one stays, named in retry.previous_mlflow_run_id
+        save_run(run)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 ANSWER_COLUMNS = ["ticker", "fy", "mode", "length", "field", "kind", "source", "depth", "question", "truth", "decoy",
-                  "answer", "correct", "outcome", "judge_reason", "judge_error", "call_error"]
+                  "decoys", "answer", "correct", "outcome", "decoy_hit", "judge_reason", "judge_error", "call_error"]
 
 
 def answer_rows(results: list[dict]) -> list[dict]:
@@ -328,29 +401,35 @@ def accuracy_metrics(results: list[dict]) -> dict:
 
 
 def paired(results: list[dict]) -> list[dict]:
-    """For every model pair, on planted single-call items both answered: the accuracy gap A-B for exact and for
-    tolerant questions, and the difference in differences (exact gap - tolerant gap) pairing each planted code with
-    its note, per length and pooled, each with a paired bootstrap 95% interval. Items pair by ticker, fy, length,
-    field."""
-    ok = {}  # model -> {(ticker, fy, length, field): correct}
+    """For every call mode and model pair, on planted items both answered: the accuracy gap A-B for planted codes
+    per length and pooled, with a paired bootstrap 95% interval. Batched entries also have the tolerant gap and the
+    difference in differences (exact gap - tolerant gap), pairing each code with its note from the same call;
+    single calls ask codes only, so those two are None there. Items pair by ticker, fy, length, field. Paired
+    entries in run files from before modes have no "mode" key: they were single."""
+    ok = {}  # mode -> model -> {(ticker, fy, length, field): correct}
     for r in results:
-        if r.get("mode") == "single" and not r.get("error"):
+        if r.get("mode") in ("batched", "single") and not r.get("error"):
             for q in r["fields"]:
-                if q.get("correct") is not None:
-                    ok.setdefault(r["model"], {})[(r["ticker"], r["fy"], r["length"], q["field"])] = bool(q["correct"])
+                if q.get("correct") is not None and q["field"].startswith("planted_"):
+                    ok.setdefault(r["mode"], {}).setdefault(r["model"], {})[
+                        (r["ticker"], r["fy"], r["length"], q["field"])] = bool(q["correct"])
     out = []
     order = [m["name"] for m in CONFIG["models"]]  # results arrive in completion order; A is first in models.json
-    for a, b in itertools.combinations(sorted(ok, key=lambda m: order.index(m) if m in order else len(order)), 2):
-        shared = ok[a].keys() & ok[b].keys()
-        for length in sorted({k[2] for k in shared}, key=lambda x: float("inf") if x == "full" else x) + [None]:
-            keys = sorted((k for k in shared if length in (None, k[2])), key=str)
-            diff = {k: ok[a][k] - ok[b][k] for k in keys}
-            did = [diff[k] - diff[n] for k in keys if k[3].startswith("planted_code_")
-                   for n in [k[:3] + (k[3].replace("planted_code_", "planted_note_"),)] if n in diff]
-            out.append({"a": a, "b": b, "length": "all" if length is None else length_label(length),
-                        "exact_gap": bootstrap_mean([d for k, d in diff.items() if k[3].startswith("planted_code_")]),
-                        "tolerant_gap": bootstrap_mean([d for k, d in diff.items() if k[3].startswith("planted_note_")]),
-                        "did": bootstrap_mean(did)})
+    for mode in ("batched", "single"):
+        by = ok.get(mode, {})
+        for a, b in itertools.combinations(sorted(by, key=lambda m: order.index(m) if m in order else len(order)), 2):
+            shared = by[a].keys() & by[b].keys()
+            for length in sorted({k[2] for k in shared}, key=lambda x: float("inf") if x == "full" else x) + [None]:
+                keys = sorted((k for k in shared if length in (None, k[2])), key=str)
+                diff = {k: by[a][k] - by[b][k] for k in keys}
+                did = [diff[k] - diff[n] for k in keys if k[3].startswith("planted_code_")
+                       for n in [k[:3] + (k[3].replace("planted_code_", "planted_note_"),)] if n in diff]
+                codes = [d for k, d in diff.items() if k[3].startswith("planted_code_")]
+                notes = [d for k, d in diff.items() if k[3].startswith("planted_note_")]
+                out.append({"mode": mode, "a": a, "b": b, "length": "all" if length is None else length_label(length),
+                            "exact_gap": bootstrap_mean(codes),
+                            "tolerant_gap": bootstrap_mean(notes) if mode == "batched" else None,
+                            "did": bootstrap_mean(did) if mode == "batched" else None})
     return out
 
 
@@ -382,8 +461,9 @@ def log_mlflow(run: dict) -> str:
         mlflow.log_dict(run, "run.json")
         for pr in run.get("paired", []):  # MLflow names allow letters, digits, _ - . / space only
             pair = re.sub(r"[^\w\-. /]", "", f"{pr['a']} vs {pr['b']}").replace("/", "-")
-            mlflow.log_metrics({f"paired{x}/{pair}/{stat}/{pr['length']}": pr[stat][y] for stat in
-                                ("exact_gap", "tolerant_gap", "did") if pr[stat]["n"]
+            mode = pr.get("mode", "single")  # paired stats before modes were single calls only
+            mlflow.log_metrics({f"paired{x}/{pair}/{mode}/{stat}/{pr['length']}": pr[stat][y] for stat in
+                                ("exact_gap", "tolerant_gap", "did") if pr.get(stat) and pr[stat]["n"]
                                 for x, y in (("", "est"), ("_lo", "lo"), ("_hi", "hi"))})
         for m in run["models"]:
             results = [r for r in run["results"] if r["model"] == m["name"]]
@@ -443,8 +523,8 @@ def start_judge_check(rid: str):
     run = json.loads((RUNS / f"{rid}.json").read_text())
     if run.get("mode") == "icl":
         raise RuntimeError("ICL runs have no judged answers")
-    if run["status"] == "running" or (run.get("judge_check") or {}).get("status") == "running":
-        raise RuntimeError("wait for the run or the current judge check to finish")
+    if busy(run):
+        raise RuntimeError("wait for the run, retry or judge check to finish")
     if "judge_check" not in CONFIG:
         raise RuntimeError('add a "judge_check" model to models.json')
     run["judge_check"] = {"status": "running", "judge": CONFIG["judge_check"]["model"]}

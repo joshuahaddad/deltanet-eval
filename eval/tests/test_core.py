@@ -1,7 +1,11 @@
 import bisect
+import json
 import datetime as dt
+import random
 import re
 import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -223,8 +227,7 @@ def test_build_context_tolerant_reference_and_depth():
     q = next(q for q in context.build_context(filing, 8192)[1] if q["field"] == "seasonality")
     assert q["depth"] is None and q["truth"] == ""  # cut off entirely
     # cut inside the passage: the reference is only what was sent, and under half of it counts as absent
-    plant_tokens = sum(context.n_tokens(p[k]) + 2 for p in context.planted_facts("T-2024")
-                       for k in ("paragraph", "decoy_paragraph") if k in p)
+    plant_tokens = sum(context.n_tokens(t) + 2 for _, t in context.planted_paragraphs(context.planted_facts("T-2024")))
     sent = len(context.truncate(filing["text"], 8192 - context.RESERVE - plant_tokens))
     starts = [m.start() for m in re.finditer("^", filing["text"], re.M)]
     for keep, present in ((0.8, True), (0.3, False)):
@@ -259,8 +262,19 @@ def test_log_mlflow(tmp_path, monkeypatch):
     from mlflow.tracking import MlflowClient
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'm.db'}")
-    rid = runs.log_mlflow(_fake_run())
+    run, bm = _fake_run(), scoring.bootstrap_mean
+    run["paired"] = [{"mode": "batched", "a": "A", "b": "B", "length": "8k", "exact_gap": bm([1]),
+                      "tolerant_gap": bm([0]), "did": bm([1])},
+                     {"mode": "single", "a": "A", "b": "B", "length": "8k", "exact_gap": bm([1]), "tolerant_gap": None,
+                      "did": None},
+                     {"a": "A", "b": "B", "length": "32k", "exact_gap": bm([0]), "tolerant_gap": bm([0]),
+                      "did": bm([])}]  # from before modes: single
+    rid = runs.log_mlflow(run)
     c = MlflowClient()
+    pm = c.get_run(rid).data.metrics
+    assert pm["paired/A vs B/batched/did/8k"] == 1 and "paired_lo/A vs B/batched/tolerant_gap/8k" in pm
+    assert "paired/A vs B/single/exact_gap/8k" in pm and "paired/A vs B/single/did/8k" not in pm
+    assert "paired/A vs B/single/tolerant_gap/32k" in pm and "paired/A vs B/single/did/32k" not in pm
     child = c.search_runs([c.get_run(rid).info.experiment_id], f"tags.mlflow.parentRunId = '{rid}'")[0]
     assert child.data.metrics["acc/exact_planted"] == 0.5 and child.data.metrics["calls_failed"] == 1
     assert child.data.metrics["acc/single/exact_planted/8k"] == 0.0
@@ -358,25 +372,41 @@ def test_log_mlflow_icl(tmp_path, monkeypatch):
 def test_decoys_placed_apart():
     facts = context.planted_facts("AAPL-2024")
     codes = [f for f in facts if f["kind"] == "exact"]
-    real = {f["target"] for f in codes}
+    targets = sorted(t for t, _ in context.planted_paragraphs(facts))
+    assert len(targets) == 3 * len(codes)  # every code, its near and its far decoy
+    assert min(b - a for a, b in zip(targets, targets[1:])) >= context.NEAR_OFFSET - 1e-9  # no two collide
     for n, f in enumerate(codes):
         d = context.DEPTHS[(n // context.PLANTS_PER_DEPTH + 2) % len(context.DEPTHS)]  # 0.1 -> 0.5, 0.7 -> 0.1, ...
-        assert abs(f["decoy_target"] - d) < 0.04 and int(f["decoy_target"] * 5) == int(d * 5)
-        assert min(abs(f["decoy_target"] - t) for t in real) >= 0.01 - 1e-9 and f["decoy"] != f["truth"]
+        far, near = f["decoy_targets"]["far"], f["decoy_targets"]["near"]
+        assert abs(far - d) < 0.04 and int(far * 5) == int(d * 5)
+        assert near - f["target"] == pytest.approx(context.NEAR_OFFSET) and int(near * 5) == int(f["target"] * 5)
+        assert len({f["truth"], *f["decoys"].values()}) == 3
+    seed = "AAPL-2024"  # the near stream is new, so the real and far decoy codes are as before it existed
+    assert codes[0]["truth"] == context.code(random.Random(seed))
+    assert codes[0]["decoys"]["far"] == context.code(random.Random(seed + "-decoy"))
     filing = {"ticker": "T", "fy": 2024, "truths": {},
               "text": "\n".join(f"Line {i} of the filing body." for i in range(20000))}
     ctx, qs = context.build_context(filing, 8192)
     assert context.n_tokens(ctx) <= 8192
-    for q in qs:
-        if "decoy" in q:
-            assert abs(q["decoy_depth"] - q["decoy_target"]) < 0.01 and f": {q['decoy']}. " in ctx
-            assert "decoy_paragraph" not in q and "paragraph" not in q
+    planted = [q for q in qs if "decoys" in q]
+    assert len(planted) == len(codes)
+    for q in planted:
+        for k in ("near", "far"):
+            assert abs(q["decoy_depths"][k] - q["decoy_targets"][k]) < 0.01 and f": {q['decoys'][k]}. " in ctx
+        assert runs.depth_label(q["decoy_depths"]["near"]) == runs.depth_label(q["depth"])
+        own, near = ctx.index(f": {q['truth']}. "), ctx.index(f": {q['decoys']['near']}. ")
+        assert 0 < near - own and ctx[own:near].count("Internal reference code") == 1  # adjacent: nothing between
+        assert "decoy_paragraphs" not in q and "paragraph" not in q
 
 
 def test_decoy_outcome():
-    assert scoring.outcome("ZK-11111-2", "QX-48213-7", "code", decoy="ZK-11111-2") == "decoy"
-    assert scoring.outcome("QX-48213-7", "QX-48213-7", "code", decoy="QX-48213-7") == "correct"  # correct wins
-    assert scoring.outcome("QX-48213-1", "QX-48213-7", "code", decoy="ZK-11111-2") == "near_miss"
+    ds = {"near": "ZK-11111-2", "far": "VV-22222-3"}
+    assert scoring.outcome("ZK-11111-2", "QX-48213-7", "code", ds) == "decoy"
+    assert scoring.decoy_hit("zk-11111-2.", ds, "code") == "near"
+    assert scoring.decoy_hit("VV-22222-3", ds, "code") == "far"
+    assert scoring.outcome("QX-48213-7", "QX-48213-7", "code", {"near": "QX-48213-7"}) == "correct"  # correct wins
+    assert scoring.outcome("QX-48213-1", "QX-48213-7", "code", ds) == "near_miss"
+    assert scoring.decoy_hit("QX-48213-7", None, "code") is None
 
 
 def test_stems():
@@ -401,15 +431,25 @@ def test_plan_modes(monkeypatch):
     monkeypatch.setattr(runs, "get_filing", _fake_filing)
     monkeypatch.setitem(runs.PRESETS["full"], "filings", [["T", 2024]])
     tasks = runs.plan("full")
+    full = context.n_tokens(_fake_filing()["text"])
     for cfg in llm.CONFIG["models"]:
         mine = [t for t in tasks if t[2] is cfg]
-        lengths = [32768] if cfg.get("provider") == "claude-code" else [8192, 32768, 131072]
+        lengths = [32768] if cfg.get("provider") == "claude-code" else [n for n in runs.PRESETS["full"]["lengths"]
+                                                                       if n < full]
         assert [t for t in mine if t[3] == "closed_book"] == [(mine[0][0], None, cfg, "closed_book", None)]
         assert sorted(t[1] for t in mine if t[3] == "batched") == lengths
-        assert len([t for t in mine if t[3] == "single"]) == 30 * len(lengths)  # every planted question
+        singles = [t[4] for t in mine if t[3] == "single"]
+        assert len(singles) == 15 * len(lengths) and all(f.startswith("planted_code_") for f in singles)  # codes only
     smoke = runs.plan("smoke")
     assert sorted((t[3], t[4]) for t in smoke if t[2] is llm.CONFIG["models"][0]) == [
-        ("batched", None), ("closed_book", None), ("single", "planted_code_50b"), ("single", "planted_note_50b")]
+        ("batched", None), ("closed_book", None), ("single", "planted_code_50b")]
+    missing = []  # the estimate's path: a filing that can't be loaded is named, not fatal
+    monkeypatch.setattr(runs, "get_filing", lambda t, fy: 1 / 0 if t == "X" else _fake_filing(t, fy))
+    monkeypatch.setitem(runs.PRESETS["full"], "filings", [["X", 2024], ["T", 2024]])
+    assert len(runs.plan("full", missing)) == len(tasks)
+    assert missing == ["X FY2024: ZeroDivisionError: division by zero"]
+    with pytest.raises(ZeroDivisionError):
+        runs.plan("full")
 
 
 def test_score_task_modes(monkeypatch):
@@ -419,7 +459,8 @@ def test_score_task_modes(monkeypatch):
 
     def fake_extract(cfg, doc, schema, **kw):
         seen.append((doc, sorted(schema["properties"]), kw))
-        return {"fiscal_year_end": "September 28, 2024", "planted_code_50b": facts["planted_code_50b"]["decoy"],
+        return {"fiscal_year_end": "September 28, 2024",
+                "planted_code_50b": facts["planted_code_50b"]["decoys"]["near"],
                 "planted_note_50b": "The collector put its fees up twice."}, {"latency_s": 1.5}
     monkeypatch.setattr(runs, "extract", fake_extract)
     fields = ["fiscal_year_end", "planted_code_50b", "planted_note_50b"]
@@ -427,6 +468,7 @@ def test_score_task_modes(monkeypatch):
     assert b["mode"] == "batched" and b["latency_s"] == 1.5 and seen[-1][1] == sorted(fields)
     got = {q["field"]: q for q in b["fields"]}
     assert got["fiscal_year_end"]["correct"] and got["planted_code_50b"]["outcome"] == "decoy"
+    assert got["planted_code_50b"]["decoy_hit"] == "near" and "decoy_hit" not in got["fiscal_year_end"]
     assert got["planted_note_50b"]["correct"]  # stems, not the judge
     s = runs.score_task(filing, 8192, cfg, "single", "planted_code_50b", fields)
     assert s["mode"] == "single" and seen[-1][1] == ["planted_code_50b"] and seen[-1][0] == seen[0][0]
@@ -452,17 +494,24 @@ def test_paired():
     r = lambda model, length, fields, mode="single", **kw: {"model": model, "ticker": "T", "fy": 2024,
                                                             "length": length, "mode": mode, "fields": fields} | kw
     results = []
-    for length in (8192, 32768):
-        for i in range(10):  # A gets every code, B half; both get every note
-            results += [r("A", length, [q(f"planted_code_{i}", True)]), r("B", length, [q(f"planted_code_{i}", i < 5)]),
-                        r("A", length, [q(f"planted_note_{i}", True)]), r("B", length, [q(f"planted_note_{i}", True)])]
-    results += [r("A", 8192, [q("revenue", False)], "batched"), r("C", 8192, [q("planted_code_0", True)], error="x")]
+    for length in (8192, 32768):  # batched: A gets every code, B half, both every note; single: B gets 2 codes of 10
+        results += [r("A", length, [q(f"planted_code_{i}", True) for i in range(10)]
+                      + [q(f"planted_note_{i}", True) for i in range(10)] + [q("revenue", False)], "batched"),
+                    r("B", length, [q(f"planted_code_{i}", i < 5) for i in range(10)]
+                      + [q(f"planted_note_{i}", True) for i in range(10)] + [q("revenue", True)], "batched")]
+        for i in range(10):
+            results += [r("A", length, [q(f"planted_code_{i}", True)]), r("B", length, [q(f"planted_code_{i}", i < 2)])]
+    results += [r("C", 8192, [q("planted_code_0", True)], error="x")]
     out = runs.paired(results)
-    assert [(p["a"], p["b"], p["length"]) for p in out] == [("A", "B", "8k"), ("A", "B", "32k"), ("A", "B", "all")]
-    pooled = out[-1]
-    assert pooled["exact_gap"]["est"] == 0.5 and pooled["exact_gap"]["n"] == 20
+    assert [(p["mode"], p["a"], p["b"], p["length"]) for p in out] == [
+        (m, "A", "B", n) for m in ("batched", "single") for n in ("8k", "32k", "all")]
+    pooled = out[2]
+    assert pooled["exact_gap"]["est"] == 0.5 and pooled["exact_gap"]["n"] == 20  # planted only, not revenue
     assert pooled["tolerant_gap"] == {"est": 0.0, "lo": 0.0, "hi": 0.0, "n": 20}
-    assert pooled["did"]["est"] == 0.5 and pooled["did"]["lo"] < 0.5 < pooled["did"]["hi"]
+    assert pooled["did"]["est"] == 0.5 and pooled["did"]["lo"] < 0.5 < pooled["did"]["hi"] and pooled["did"]["n"] == 20
+    single = out[-1]
+    assert single["exact_gap"]["est"] == 0.8 and single["exact_gap"]["n"] == 20
+    assert single["tolerant_gap"] is None and single["did"] is None
 
 
 def test_hf_router_catalogue(monkeypatch):
@@ -493,3 +542,69 @@ def test_paired_order_follows_models_json(monkeypatch):
             "fields": [{"field": "planted_code_10a", "correct": m == "A"}]} for m in ("B", "A")]
     out = runs.paired(res)
     assert out[0]["a"] == "A" and out[0]["exact_gap"]["est"] == 1
+
+
+@pytest.mark.parametrize("fails, cause, attempts", [(2, "busy", 3), (4, "busy", None), (1, "invalid", None)])
+def test_call_retries_transport_failures(monkeypatch, fails, cause, attempts):
+    class Busy(Exception):
+        status_code = 503
+    tries, waits = [], []
+
+    def create(**kw):
+        tries.append(1)
+        if len(tries) <= fails:  # as Instructor raises it: the API error is the cause
+            e = RuntimeError("wrapped")
+            e.__cause__ = Busy() if cause == "busy" else ValueError("schema")
+            raise e
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2, model_extra={})
+        return llm.Verdict(reason="r", correct=True), SimpleNamespace(usage=usage)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create_with_completion=create)))
+    monkeypatch.setattr(llm.instructor, "from_openai", lambda *a, **kw: client)
+    monkeypatch.setattr(llm.time, "sleep", waits.append)
+    monkeypatch.setenv("TEST_KEY", "k")
+    cfg = {"name": "M", "base_url": "https://example.com/v1", "api_key_env": "TEST_KEY", "model": "m"}
+    if attempts is None:
+        with pytest.raises(RuntimeError, match="wrapped"):
+            llm.call(cfg, [{"role": "user", "content": "hi"}], llm.Verdict)
+        assert len(tries) == (4 if cause == "busy" else 1)  # validation failures are not retried here
+    else:
+        out, meta = llm.call(cfg, [{"role": "user", "content": "hi"}], llm.Verdict)
+        assert out["correct"] and meta["attempts"] == attempts
+    assert [round(w / b) for w, b in zip(waits, llm.BACKOFF_S)] == [1] * len(waits)  # 10s, 30s, 60s plus jitter
+    assert len(waits) == min(fails, 3) * (cause == "busy")
+
+
+def test_start_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(runs, "RUNS", tmp_path)
+    monkeypatch.setattr(runs, "_contexts", {})
+    monkeypatch.setattr(runs, "get_filing", lambda t, fy: _fake_filing(t, fy))
+    monkeypatch.setattr(runs, "model_cfg", lambda name: {"name": name, "model": "m"})
+    monkeypatch.setattr(runs, "log_mlflow", lambda run: "new")
+    monkeypatch.setattr(runs, "threading", SimpleNamespace(  # run the retry inline
+        Lock=threading.Lock, Thread=lambda target, daemon: SimpleNamespace(start=target)))
+    filing, cfg = _fake_filing(), {"name": "M", "model": "m"}
+    monkeypatch.setattr(runs, "extract", lambda *a, **kw: ({}, {"cost": 0.1}))
+    good = runs.score_task(filing, 8192, cfg, "single", "planted_code_10a", None)
+    monkeypatch.setattr(runs, "extract", lambda *a, **kw: 1 / 0)
+    bad = [runs.score_task(filing, 8192, cfg, "single", "planted_code_50b", None),
+           runs.score_task(filing, 32768, cfg, "batched", None, None)]
+    run = {"id": "r", "preset": "full", "design": context.DESIGN, "status": "done", "results": [good, *bad],
+           "mlflow_run_id": "old", "total_cost": 0.1}
+    runs.save_run(run)
+    monkeypatch.setattr(runs, "extract", lambda cfg, doc, schema, **kw: ({k: None for k in schema["properties"]},
+                                                                         {"cost": 0.5}))
+    runs.start_retry("r")
+    got = json.loads((tmp_path / "r.json").read_text())
+    assert got["results"][0] == good and not any(r.get("error") for r in got["results"])
+    assert [(r["mode"], r["length"], r["fields"][0]["field"]) for r in got["results"][1:]] == [
+        ("single", 8192, "planted_code_50b"), ("batched", 32768, bad[1]["fields"][0]["field"])]
+    assert got["total_cost"] == pytest.approx(1.1) and got["mlflow_run_id"] == "new" and isinstance(got["paired"], list)
+    assert got["retry"]["status"] == "done" and got["retry"]["calls"] == 2 and got["retry"]["still_failed"] == 0
+    assert got["retry"]["previous_mlflow_run_id"] == "old"
+    for design in (None, context.DESIGN - 1):  # old runs have no design: their contexts can't be rebuilt
+        runs.save_run({k: v for k, v in run.items() if k != "design"} | ({"design": design} if design else {}))
+        with pytest.raises(RuntimeError, match="design"):
+            runs.start_retry("r")
+    runs.save_run(run | {"status": "running"})
+    with pytest.raises(RuntimeError, match="wait"):
+        runs.start_retry("r")
