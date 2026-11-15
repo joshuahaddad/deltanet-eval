@@ -51,7 +51,8 @@ class Batching(Scene):
                 a, b = [x(p, v[m, mode, L]) for mode in ("single", "batched")]
                 single.add(Circle(0.11, color=c, stroke_width=3).move_to([a, y, 0]))
                 g = round(100 * gain[m, L])
-                lab = Text(f"{g:+d}".replace("-", "−"), font_size=style.SMALL, color=c)
+                # maths font: CMU Serif's minus is a hairline next to its plus; Euler draws both at one weight
+                lab = MathTex(f"{g:+d}", font_size=style.SMALL * 1.5, color=c)
                 lab.next_to([b, y, 0], RIGHT if b > a else LEFT, buff=0.2)
                 move[m, L] = VGroup(Line([a, y, 0], [b, y, 0], buff=0.11, color=c, stroke_width=4), Dot([b, y, 0], radius=0.12, color=c), lab)
 

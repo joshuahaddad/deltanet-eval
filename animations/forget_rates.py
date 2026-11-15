@@ -1,5 +1,5 @@
 """A stored value's strength over 300 tokens: GDN decays a whole head at one rate (α = 0.99); KDA gives each channel its
-own, so a slow channel (α = 0.999) keeps the member ID while a fast one (α = 0.97) drops the boilerplate."""
+own, so a slow channel (α = 0.999) keeps a cover-page fact while a fast one (α = 0.97) drops the boilerplate."""
 import numpy as np
 from manim import *
 import style
@@ -41,7 +41,7 @@ class ForgetRates(Scene):
             return Dot(ax.c2p(half(a), 0.5), radius=0.08, color=c)
         g_lab = Tex(rf"whole head, $\alpha = {GDN}$\\half-life {half(GDN):.0f} tokens", font_size=MATH, color=style.ORANGE)
         g_lab.next_to(axl.c2p(half(GDN), 0.5), UR, buff=0.2)
-        s_lab = Tex(rf"member ID (slow), $\alpha = {SLOW}$\\half-life {half(SLOW):.0f} tokens", font_size=MATH,
+        s_lab = Tex(rf"cover page (slow), $\alpha = {SLOW}$\\half-life {half(SLOW):.0f} tokens", font_size=MATH,
                     color=style.ORANGE).move_to(axr.c2p(T, 0.66), aligned_edge=UR)
         f_lab = Tex(rf"boilerplate (fast), $\alpha = {FAST}$\\half-life {half(FAST):.0f} tokens", font_size=MATH,
                     color=style.MUTED).move_to(axr.c2p(T, 0.08), aligned_edge=DR)
