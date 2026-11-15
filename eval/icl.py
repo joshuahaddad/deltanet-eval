@@ -16,8 +16,8 @@ from paths import CACHE
 
 SEED = 42  # HELMET's default --seed
 HELMET_TEST = 500  # HELMET's max_test_samples; our test items are a prefix of its balanced 500
-# name: HF repo, pinned revision, train file, test file (HELMET uses CLINC's validation split), label column,
-# label count (CLINC "plus" includes the out-of-scope label), and HELMET's shots per target length
+# name: HF repo, pinned revision, train file, test file, label column, label count, and HELMET's shots per
+# target length
 DATASETS = {
     "banking77": ("PolyAI/banking77", "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6",
                   "data/train-00000-of-00001.parquet", "data/test-00000-of-00001.parquet", "label", 77,

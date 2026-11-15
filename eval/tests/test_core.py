@@ -331,7 +331,7 @@ def test_icl_plan_model_lengths(monkeypatch):
     monkeypatch.setattr(icl, "test_items", lambda name, n: [{"id": i, "text": f"{name} {i}", "label": 0} for i in range(n)])
     tasks = runs.plan("icl")
     claude = [t for t in tasks if t[2].get("provider") == "claude-code"]
-    assert len(tasks) == 2 * 50 * (2 * 3 + 1) and {t[1] for t in claude} == {32768}
+    assert len(tasks) == 50 * (2 * 3 + 1) and {t[1] for t in claude} == {32768}
     assert len(runs.plan("icl-smoke")) == 5 * len(llm.CONFIG["models"])
 
 

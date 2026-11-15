@@ -2,7 +2,7 @@
 
 A small long-context extraction eval on SEC 10-K filings. It measures *exact* recall (figures, dates, IDs) against *tolerant* recall (gist), by depth in the document and by context length. It compares a linear-attention hybrid (3 delta-rule layers to 1 full-attention layer) with full-attention models. It is also a plain extraction tool: give it a document and a JSON schema, and it returns JSON.
 
-A second mode, [HELMET ICL](#helmet-icl-mode), covers the other half of the claim: many-shot in-context learning on two intent-classification datasets, a long-context task that rewards the gist of thousands of examples rather than one exact string.
+A second mode, [HELMET ICL](#helmet-icl-mode), covers the other half of the claim: many-shot in-context learning on a banking intent-classification dataset, a long-context task that rewards the gist of thousands of examples rather than one exact string.
 
 > The models compared differ in size and training, not just attention, so gaps here are not a clean test of the architecture.
 
@@ -217,7 +217,7 @@ These motivated design 2: near decoys, to make the exact task harder where it wa
 
 ## HELMET ICL mode
 
-**What it measures.** [HELMET](https://github.com/princeton-nlp/HELMET) (Yen et al., ICLR 2025, [arXiv:2410.02694](https://arxiv.org/abs/2410.02694)) has a many-shot in-context learning category. The prompt holds hundreds to thousands of labelled examples (`text`, then `label: N`), followed by one unlabelled text, and the model must give its label. Labels are shown as **random integers**, not intent names, so the model can't lean on what "card_arrival" means. It has to learn the mapping from the examples in the context. This mode runs the two customer-support intent datasets: [BANKING77](https://huggingface.co/datasets/PolyAI/banking77) (77 banking intents) and [CLINC150](https://huggingface.co/datasets/clinc/clinc_oos) (150 intents across 10 domains, plus out-of-scope, 151 labels).
+**What it measures.** [HELMET](https://github.com/princeton-nlp/HELMET) (Yen et al., ICLR 2025, [arXiv:2410.02694](https://arxiv.org/abs/2410.02694)) has a many-shot in-context learning category. The prompt holds hundreds to thousands of labelled examples (`text`, then `label: N`), followed by one unlabelled text, and the model must give its label. Labels are shown as **random integers**, not intent names, so the model can't lean on what "card_arrival" means. It has to learn the mapping from the examples in the context. This mode runs HELMET's banking dataset, [BANKING77](https://huggingface.co/datasets/PolyAI/banking77) (77 banking intents), to keep the focus on the financial domain.
 
 **Why it's the gist case.** No single example holds the answer, and no exact string has to be copied out. The model needs a summary of what each label's examples have in common, built up over the whole context. A fixed-size recurrent state can hold that kind of summary, so the post's claim predicts that a linear-attention hybrid keeps up with full attention here, while it falls behind on the exact panels above. The Kimi Linear paper ([arXiv:2510.26692](https://arxiv.org/abs/2510.26692), Table 5, models trained on 1.4T tokens, at 128k context) reports HELMET-ICL at 90.0 for Kimi Linear, 88.0 for full-attention MLA and 85.5 for the Gated DeltaNet hybrid (GDN-H).
 
@@ -228,7 +228,7 @@ These motivated design 2: near decoys, to make the exact task harder where it wa
 | Preset | Datasets | Lengths | Test items | Models | Calls |
 |---|---|---|---|---|---|
 | `icl-smoke` | BANKING77 | 32k | 5 | every model | 15 |
-| `icl` | BANKING77, CLINC150 | 32k, 64k, 128k | 50 each | every model; Claude at 32k only | 700 |
+| `icl` | BANKING77 | 32k, 64k, 128k | 50 | every model; Claude at 32k only | 350 |
 
 One call is one test item at one length. A preset's `model_lengths` limits a model, by its `name` or its `provider`, to some lengths. `icl` sets `{"claude-code": [32768]}`, because Claude runs on subscription quota, and so does the filing preset `full`.
 
@@ -237,30 +237,30 @@ One call is one test item at one length. A preset's `model_lengths` limits a mod
 | Preset | Qwen3-Next | Qwen3-235B | Claude Sonnet (quota) |
 |---|---|---|---|
 | `icl-smoke` | 0.13M tokens, about $0.01 | 0.13M, about $0.01 | 0.13M |
-| `icl` | 18.5M tokens, about $1.67 | 18.5M, about $1.67 | 2.65M |
+| `icl` | 9.3M tokens, about $0.84 | 9.3M, about $0.84 | 1.32M |
 
 The dollar figures use DeepInfra's $0.09 per million input tokens. The page can't price Hugging Face or Claude Code models, so it shows these token counts with the estimate instead. Each test item gets its own demos and label mapping, so prompt caching doesn't help. Qwen's own tokenizer and Claude Code's harness add to the reported prompt tokens. With 50 items, a 70% cell has a Wilson 95% interval of roughly 56–81%.
 
 **How HELMET builds the prompts, and what is replicated.** From HELMET's `data.py` (`load_icl`), `configs/icl.yaml`, `configs/icl_short.yaml` and `scripts/generate_configs.py`, at commit [`aeadacc`](https://github.com/princeton-nlp/HELMET/tree/aeadacc6593e9a222a84b0660b186a4e23d2efda):
 
-- **Data.** HELMET loads the original Hugging Face datasets, not its own `princeton-nlp/HELMET` archive. That archive holds the other tasks' data, and its card states no licence. BANKING77: `PolyAI/banking77`, demos from `train` (10,003 rows) and test items from `test` (3,080). CLINC150: `clinc/clinc_oos`, config `plus`, demos from `train` (15,250) and test items from **`validation`** (3,100). `icl.py` downloads only those four parquet files, at pinned revisions, into `.cache/icl/`. The BANKING77 row order matches PolyAI's original `train.csv` and `test.csv`, which matters, because HELMET's sampling depends on it. **Replicated.**
-- **Shots per target length.** BANKING77: 360, 720, 1,450, 2,900 and 5,900 at 8k, 16k, 32k, 64k and 128k. CLINC150: 440, 880, 1,750, 3,525 and 7,050. All are `*_balance`. **Replicated**, with the budget deviation below.
+- **Data.** HELMET loads the original Hugging Face datasets, not its own `princeton-nlp/HELMET` archive. That archive holds the other tasks' data, and its card states no licence. BANKING77: `PolyAI/banking77`, demos from `train` (10,003 rows) and test items from `test` (3,080). `icl.py` downloads only those two parquet files, at pinned revisions, into `.cache/icl/`. The BANKING77 row order matches PolyAI's original `train.csv` and `test.csv`, which matters, because HELMET's sampling depends on it. **Replicated.**
+- **Shots per target length.** BANKING77: 360, 720, 1,450, 2,900 and 5,900 at 8k, 16k, 32k, 64k and 128k. It is `banking77_balance`. **Replicated**, with the budget deviation below.
 - **Demo selection and order.** For each test item, `local_seed = (int(sha256(text)) + 42) mod 2^31`. `balance_labels(train, shots, local_seed)` makes ceil(shots / labels) rounds holding one example per label each, shuffles each round, and cuts the list to `shots`. A label with too few examples is drawn again with replacement. **Replicated** line for line, using Python's `random` the same way.
 - **Label remapping.** For each test item, `range(num_labels)` is shuffled with `random.seed(local_seed)`. Each original label shows as that integer in the demos and in the answer, so the mapping is a bijection and changes from item to item. **Replicated.**
-- **Test set.** `max_test_samples` is 500. HELMET shuffles the test split with `Dataset.shuffle(seed=42)` (`numpy.random.default_rng(42).permutation`) and then balances it with `balance_labels(test, 500, 42)`. **Replicated**. Our items are the **first 50 (or 5) of HELMET's 500**, so they are a subset of its test set, and each covers a different label. Item IDs are row indices in the split. Demos come from the train split, so no test item is among the demos, and none of the 50 test texts per dataset appears verbatim in its train split.
+- **Test set.** `max_test_samples` is 500. HELMET shuffles the test split with `Dataset.shuffle(seed=42)` (`numpy.random.default_rng(42).permutation`) and then balances it with `balance_labels(test, 500, 42)`. **Replicated**. Our items are the **first 50 (or 5) of HELMET's 500**, so they are a subset of its test set, and each covers a different label. Item IDs are row indices in the split. Demos come from the train split, so no test item is among the demos, and none of the 50 test texts appears verbatim in the train split.
 - **Prompt template.** HELMET sends `Use the provided mapping from the text to label to assign a label to the text. Only output "label: {label}" and nothing else.`, then the demos joined by blank lines, each `<text>\nlabel: <int>`, then the test text. Generation is greedy, at most 20 tokens, and stops at a newline.
 - **Parsing and scoring.** HELMET takes the text after `label:` on the first line (`parse_output`). Its reported ICL metric is `exact_match` after SQuAD-style normalisation (lowercase, no punctuation or articles), one score per dataset.
 
 **Deviations.**
 
 - **Structured output, not free text.** As the app requires, answers go through `llm.extract`: Instructor in JSON mode for OpenAI-compatible endpoints, `claude -p --json-schema` for Claude. The schema is a single integer field, `label`. HELMET's output instruction ("Only output label: …") is dropped, because the schema takes its place. The instruction goes in the system message. The demos go inside `extract`'s `<document>` tags, and the test text follows them. A JSON object is a different output task from continuing `label:`, and Instructor retries a malformed answer up to twice. **Absolute numbers aren't directly comparable to HELMET's or to the Kimi Linear paper's.** Compare models within this app.
-- **Token budget.** HELMET's shot counts were sized with the Llama-3.1 tokenizer. HELMET then cuts trailing context tokens to fit `length − 20 − 100`. Here prompts are counted with `o200k_base`, and whole trailing demos are dropped to fit `length − 2048` (the app's `RESERVE`, for the schema and Claude Code's overhead). At 16k and above every HELMET shot fits: 26k, 52k and 106k tokens at 32k, 64k and 128k for BANKING77, and about the same for CLINC150. At 8k, 336 of 360 BANKING77 shots and 407 of 440 CLINC150 shots fit.
-- **Test size.** 50 items per dataset instead of 500, to keep the quota and cost small. The intervals are about three times wider.
-- **Two of HELMET's five ICL datasets.** TREC coarse, TREC fine and NLU are left out, so this is not HELMET's ICL category average. The Kimi Linear paper doesn't say which HELMET-ICL subsets or decoding settings its 90.0 uses.
+- **Token budget.** HELMET's shot counts were sized with the Llama-3.1 tokenizer. HELMET then cuts trailing context tokens to fit `length − 20 − 100`. Here prompts are counted with `o200k_base`, and whole trailing demos are dropped to fit `length − 2048` (the app's `RESERVE`, for the schema and Claude Code's overhead). At 16k and above every HELMET shot fits: 26k, 52k and 106k tokens at 32k, 64k and 128k. At 8k, 336 of 360 shots fit.
+- **Test size.** 50 items instead of 500, to keep the quota and cost small. The intervals are about three times wider.
+- **One of HELMET's five ICL datasets.** CLINC150, TREC coarse, TREC fine and NLU are left out, to keep the focus on banking, so this is not HELMET's ICL category average. The Kimi Linear paper doesn't say which HELMET-ICL subsets or decoding settings its 90.0 uses.
 - **Decoding.** Temperature 0 through Instructor, where HELMET decodes greedily. Claude Code exposes no temperature setting.
 - **Failed calls** (transport errors, or no valid JSON after retries) are shown, counted in `calls_failed` and left out of accuracy, as in the filing eval. A null or wrong label counts as wrong.
 
-**Licences.** HELMET's code is MIT. BANKING77 is CC BY 4.0, per the [Hugging Face card](https://huggingface.co/datasets/PolyAI/banking77) and [PolyAI's repo](https://github.com/PolyAI-LDN/task-specific-datasets/blob/master/LICENSE). CLINC150 is CC BY 3.0, per the [Hugging Face card](https://huggingface.co/datasets/clinc/clinc_oos) and the [original repo's LICENSE](https://github.com/clinc/oos-eval/blob/master/LICENSE). Both allow reuse with attribution: Casanueva et al. 2020 for BANKING77 and Larson et al. 2019 for CLINC150. The data is cached, not committed. Run files keep each test item's text, which is attributed here.
+**Licences.** HELMET's code is MIT. BANKING77 is CC BY 4.0, per the [Hugging Face card](https://huggingface.co/datasets/PolyAI/banking77) and [PolyAI's repo](https://github.com/PolyAI-LDN/task-specific-datasets/blob/master/LICENSE). It allows reuse with attribution: Casanueva et al. 2020. The data is cached, not committed. Run files keep each test item's text, which is attributed here.
 
 ## Cost to serve: memory per sequence
 
@@ -305,7 +305,7 @@ If the recurrent state is kept in fp32, as some kernels do, it doubles to about 
 - `scoring.py`: number and date parsing, exact match, outcomes (decoy included), stems, locating facts, Wilson intervals, the paired bootstrap and judge agreement.
 - `context.py`: the planted design number, planted facts and their near and far decoys, truncation and token counting, and building the context sent.
 - `llm.py`: `models.json`, the OpenRouter and Hugging Face price listings, JSON schema to pydantic, model calls (Instructor and Claude Code) with their latency, backoff on transient errors, extraction and the judge.
-- `icl.py`: HELMET's ICL data (BANKING77 and CLINC150 from Hugging Face), demo balancing, label remapping, test-item selection and prompt building.
+- `icl.py`: HELMET's ICL data (BANKING77 from Hugging Face), demo balancing, label remapping, test-item selection and prompt building.
 - `runs.py`: presets, call modes, cost estimates, the run, retry and judge-check lifecycle, per-mode metrics, the paired headline, ICL scoring, and MLflow logging.
 - `paths.py`: the shared paths.
 - `index.html`: the single page.

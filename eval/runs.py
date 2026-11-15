@@ -29,7 +29,7 @@ PRESETS = {
              "model_lengths": {"claude-code": [32768]}},  # Claude runs on subscription quota
     # HELMET many-shot ICL: one call per test item; model_lengths limits a model (by name or provider) to some lengths
     "icl-smoke": {"mode": "icl", "datasets": ["banking77"], "lengths": [32768], "items": 5},
-    "icl": {"mode": "icl", "datasets": ["banking77", "clinc150"], "lengths": [32768, 65536, 131072], "items": 50,
+    "icl": {"mode": "icl", "datasets": ["banking77"], "lengths": [32768, 65536, 131072], "items": 50,
             "model_lengths": {"claude-code": [32768]}},  # Claude runs on subscription quota
 }
 
