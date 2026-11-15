@@ -1,5 +1,5 @@
 """The series' eight questions as one still: what builds on what.
-Part 2 (this post) is orange, Part 1 (last post) muted; the destination keeps its thick border."""
+Part 2 (this post) is orange, Part 1 (last post) muted. The destination card has the same border weight as the rest."""
 from manim import *
 import style
 
@@ -31,7 +31,7 @@ def card(k):
     lab = VGroup(Paragraph(*name.split("\n"), font_size=style.SMALL, color=style.INK, alignment="center"),
                  Paragraph(*sub.split("\n"), font_size=style.SMALL, color=style.ORANGE if NODES[k][2] == 2 else style.MUTED, alignment="center")).arrange(DOWN, buff=0.12)
     box = RoundedRectangle(width=3.1, height=lab.height + 0.45, corner_radius=0.12, fill_color=style.SURFACE, fill_opacity=1,
-                           stroke_color=colour(k), stroke_width=style.DATA if k == "nope" else style.STRUCTURE)
+                           stroke_color=colour(k), stroke_width=style.STRUCTURE)
     return VGroup(box, lab)
 
 
