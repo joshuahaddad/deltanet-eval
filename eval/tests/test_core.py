@@ -627,11 +627,14 @@ def test_start_retry(tmp_path, monkeypatch):
 
 def test_analyze_runs_on_committed_runs(tmp_path, capsys):
     import analyze
-    for name in ["20261114-193139-full", "20261114-202305-icl"]:
+    for name, fn in [("20261114-193139-full", analyze.filings), ("20261114-202305-icl", analyze.icl)]:
         path = runs.RUNS / f"{name}.json"
         if not path.exists():
             pytest.skip(f"{name} not present")
         run = json.loads(path.read_text())
-        (analyze.icl_report if run.get("mode") == "icl" else analyze.filing_report)(run, tmp_path)
-    assert {p.name for p in tmp_path.iterdir()} >= {"length_curves.png", "depth_heatmaps.png", "icl_banking77.png"}
-    assert "| Qwen3-Next 80B-A3B |" in capsys.readouterr().out
+        fn(analyze.merge([run, run]), tmp_path)  # merging a run with itself keeps one copy of each model
+    assert {p.name for p in tmp_path.iterdir()} == {"exact_by_length.png", "single_outcomes.png", "hallucination.png",
+                                                    "closed_book.png", "icl.png"}
+    out = capsys.readouterr().out
+    assert "## 1–4." in out and "## 8." in out
+    assert "| Qwen3-Next 80B-A3B | 9% (9/98" in out  # hallucination: 9 of 98 absent facts answered
