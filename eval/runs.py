@@ -32,6 +32,9 @@ PRESETS = {
     "icl": {"mode": "icl", "datasets": ["banking77"], "lengths": [32768, 65536, 131072], "items": 50,
             "model_lengths": {"claude-code": [32768]}},  # Claude runs on subscription quota
 }
+# the full grid for Qwen3-30B-A3B only: the other models' design-2 results are in runs/20261114-193139-full.json
+PRESETS["full-30b"] = PRESETS["full"] | {"model_lengths": {
+    "Qwen3-Next 80B-A3B (Gated DeltaNet hybrid)": [], "Qwen3 235B-A22B (full attention)": [], "claude-code": []}}
 
 
 def model_lengths(p: dict, cfg: dict) -> list:

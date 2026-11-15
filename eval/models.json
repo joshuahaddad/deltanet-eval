@@ -15,6 +15,17 @@
       "context_length": 262144
     },
     {
+      "name": "Qwen3 30B-A3B (full attention)",
+      "base_url": "https://router.huggingface.co/v1",
+      "api_key_env": "HF_TOKEN",
+      "model": "Qwen/Qwen3-30B-A3B-Instruct-2507:featherless-ai",
+      "context_length": 262144,
+      "pricing": {
+        "input": 0.125,
+        "output": 0.45
+      }
+    },
+    {
       "name": "Claude Sonnet 5.5",
       "provider": "claude-code",
       "model": "claude-sonnet-5-5",

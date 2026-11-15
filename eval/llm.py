@@ -65,9 +65,10 @@ def catalogue(cfg: dict) -> dict:
         return _catalogue[base].get(cfg["model"], {})
     model, _, provider = cfg["model"].partition(":")  # "org/model:deepinfra" pins the provider
     p = next((p for p in _catalogue[base].get(model, {}).get("providers", []) if p["provider"] == provider), None)
-    if not p:
+    if not p and "pricing" not in cfg:
         return {}
-    price = p.get("pricing")  # $ per million tokens; OpenRouter's shape is $ per token
+    p = p or {}
+    price = p.get("pricing") or cfg.get("pricing")  # $ per million tokens; OpenRouter's shape is $ per token
     return {"context_length": p.get("context_length")} | (
         {"pricing": {"prompt": price["input"] / 1e6, "completion": price["output"] / 1e6}} if price else {})
 

@@ -331,7 +331,8 @@ def test_icl_plan_model_lengths(monkeypatch):
     monkeypatch.setattr(icl, "test_items", lambda name, n: [{"id": i, "text": f"{name} {i}", "label": 0} for i in range(n)])
     tasks = runs.plan("icl")
     claude = [t for t in tasks if t[2].get("provider") == "claude-code"]
-    assert len(tasks) == 50 * (2 * 3 + 1) and {t[1] for t in claude} == {32768}
+    api = sum(m.get("provider") != "claude-code" for m in llm.CONFIG["models"])
+    assert len(tasks) == 50 * (api * 3 + 1) and {t[1] for t in claude} == {32768}
     assert len(runs.plan("icl-smoke")) == 5 * len(llm.CONFIG["models"])
 
 
@@ -450,6 +451,20 @@ def test_plan_modes(monkeypatch):
     assert missing == ["X FY2024: ZeroDivisionError: division by zero"]
     with pytest.raises(ZeroDivisionError):
         runs.plan("full")
+
+
+def test_full_30b_plans_the_control_only(monkeypatch):
+    monkeypatch.setattr(runs, "get_filing", _fake_filing)
+    monkeypatch.setitem(runs.PRESETS["full-30b"], "filings", [["T", 2024]])
+    assert {t[2]["name"] for t in runs.plan("full-30b")} == {"Qwen3 30B-A3B (full attention)"}
+
+
+def test_catalogue_price_from_models_json(monkeypatch):
+    base = "https://router.huggingface.co/v1"
+    monkeypatch.setitem(llm._catalogue, base, {})  # the router lists no provider for it
+    cfg = {"base_url": base, "model": "org/m:featherless-ai", "pricing": {"input": 0.125, "output": 0.45}}
+    assert llm.catalogue(cfg)["pricing"] == pytest.approx({"prompt": 0.125e-6, "completion": 0.45e-6})
+    assert llm.catalogue({k: v for k, v in cfg.items() if k != "pricing"}) == {}
 
 
 def test_score_task_modes(monkeypatch):
@@ -608,3 +623,15 @@ def test_start_retry(tmp_path, monkeypatch):
     runs.save_run(run | {"status": "running"})
     with pytest.raises(RuntimeError, match="wait"):
         runs.start_retry("r")
+
+
+def test_analyze_runs_on_committed_runs(tmp_path, capsys):
+    import analyze
+    for name in ["20261114-193139-full", "20261114-202305-icl"]:
+        path = runs.RUNS / f"{name}.json"
+        if not path.exists():
+            pytest.skip(f"{name} not present")
+        run = json.loads(path.read_text())
+        (analyze.icl_report if run.get("mode") == "icl" else analyze.filing_report)(run, tmp_path)
+    assert {p.name for p in tmp_path.iterdir()} >= {"length_curves.png", "depth_heatmaps.png", "icl_banking77.png"}
+    assert "| Qwen3-Next 80B-A3B |" in capsys.readouterr().out
