@@ -29,10 +29,10 @@ ROW_Y = [1.0, -0.3, -1.6]
 
 class Batching(Scene):
     def construct(self):
-        title = Text("Batched questions rescue full attention, not the hybrid", font_size=style.BODY).set_y(3.4)
-        key = VGroup(Circle(0.09, color=style.INK, stroke_width=3), Text("one code per call", font_size=style.SMALL),
+        title = Text("Single vs Batched Calls", font_size=style.BODY).set_y(3.4)
+        key = VGroup(Circle(0.09, color=style.INK, stroke_width=3), Text("single call", font_size=style.SMALL),
                      Arrow(ORIGIN, 0.8 * RIGHT, buff=0, color=style.INK, stroke_width=3, max_tip_length_to_length_ratio=0.3),
-                     Dot(radius=0.1, color=style.INK), Text("all 15 codes in one call", font_size=style.SMALL))
+                     Dot(radius=0.1, color=style.INK), Text("batched call", font_size=style.SMALL))
         key.arrange(RIGHT, buff=0.2).set_y(2.6)
         x = lambda p, a: PANEL_X[p] + (a - LO) / (HI - LO) * W
 
