@@ -1,4 +1,4 @@
-"""HELMET's many-shot in-context learning task on BANKING77 and CLINC150: data, demos and prompts.
+"""HELMET's many-shot in-context learning task on BANKING77: data, demos and prompts.
 
 Replicates HELMET's data.py `load_icl` (github.com/princeton-nlp/HELMET, commit aeadacc): balanced demos from the
 train split, a fresh random integer label mapping per test item, and a label-balanced test set."""
@@ -22,9 +22,6 @@ DATASETS = {
     "banking77": ("PolyAI/banking77", "1846984189f2bc0ac51c6fc3a600fa9e1714e0c6",
                   "data/train-00000-of-00001.parquet", "data/test-00000-of-00001.parquet", "label", 77,
                   {8192: 360, 16384: 720, 32768: 1450, 65536: 2900, 131072: 5900}),
-    "clinc150": ("clinc/clinc_oos", "155b9c710419136e17307b80d0a13e68cd46b4ec",
-                 "plus/train-00000-of-00001.parquet", "plus/validation-00000-of-00001.parquet", "intent", 151,
-                 {8192: 440, 16384: 880, 32768: 1750, 65536: 3525, 131072: 7050}),
 }
 # HELMET: 'Use the provided mapping from the text to label to assign a label to the text. Only output "label:
 # {label}" and nothing else.' The output sentence is replaced by the schema, since answers go through Instructor.
